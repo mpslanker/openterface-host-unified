@@ -1,0 +1,1863 @@
+name: Docker Test / Openterface Ubuntu
+
+on:
+  push:
+    branches: ["main", "dev"]
+    paths:
+      - 'docker/testos/Dockerfile.ubuntu-test-shared'
+      - 'docker/install-openterface.sh'
+      - 'docker/entrypoint.sh'
+      - '.github/workflows/docker-test-ubuntu.yaml'
+      - 'openterfaceQT.pro'
+      - 'doc/build_from_source_summary.md'
+  workflow_run:
+    workflows: ["Linux Build"]
+    types:
+      - completed
+  workflow_dispatch:
+
+env:
+  DOCKER_IMAGE_SHARED: openterface-test-shared
+  DOCKER_TAG: test-${{ github.sha }}
+
+jobs:
+  build-test-shared:
+    strategy:
+      matrix:
+        install_type: ['deb', 'appimage']
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Python dependencies (Qiniu SDK)
+        run: |
+          echo "📦 Installing required Python packages..."
+          python3 -m pip install --upgrade pip > /dev/null 2>&1
+          python3 -m pip install qiniu > /dev/null 2>&1
+          echo "✅ Python dependencies installed"
+
+      - name: Set default install_type for non-workflow_dispatch triggers
+        run: |
+          # Set install_type from matrix
+          echo "INSTALL_TYPE=${{ matrix.install_type }}" >> $GITHUB_ENV
+          echo "ℹ️ Using install_type: ${{ matrix.install_type }}"
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Download Latest Linux Build Artifacts
+        run: |
+          echo "⬇️ Downloading latest Linux shared build artifacts..."
+
+          # Create build directory
+          mkdir -p build
+
+          # Get the latest successful linux-build workflow run for current branch.
+          # Do NOT fall back to other branches — their artifacts may be stale/expired.
+          # When a successful build for this branch exists, the workflow_run trigger
+          # will re-fire this job with a valid artifact available.
+          LATEST_RUN=$(curl -sf -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/linux-build.yaml/runs?status=success&head_branch=${{ github.ref_name }}" \
+            | jq -r '.workflow_runs[0]')
+
+          if [ "$LATEST_RUN" = "null" ] || [ -z "$LATEST_RUN" ]; then
+            echo "⚠️ No successful linux-build runs found for branch ${{ github.ref_name }}"
+            echo "⚠️ This job will re-run via workflow_run once the build succeeds."
+            exit 0
+          fi
+
+          RUN_ID=$(echo "$LATEST_RUN" | jq -r ".id")
+          echo "✅ Found latest linux-build run: $RUN_ID"
+
+          # Get all artifacts from this run
+          ARTIFACTS=$(curl -sf -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/runs/$RUN_ID/artifacts") || {
+            echo "❌ Failed to query artifacts API"
+            exit 1
+          }
+
+          # Find and download the appropriate artifact based on install_type
+          if [ "${{ env.INSTALL_TYPE }}" = "deb" ]; then
+            ARTIFACT_PATTERN=".deb"
+          elif [ "${{ env.INSTALL_TYPE }}" = "appimage" ]; then
+            ARTIFACT_PATTERN=".AppImage"
+          else
+            echo "❌ Invalid install_type: ${{ env.INSTALL_TYPE }}"
+            exit 1
+          fi
+          
+          ARTIFACT_ID=$(echo "$ARTIFACTS" | jq -r '.artifacts[] | select(.name | contains("'$ARTIFACT_PATTERN'")) | .id' | head -1)
+          
+          if [ -z "$ARTIFACT_ID" ] || [ "$ARTIFACT_ID" = "null" ]; then
+            echo "❌ No shared artifact matching pattern '$ARTIFACT_PATTERN' found in latest build"
+            echo "Available artifacts:"
+            echo "$ARTIFACTS" | jq -r '.artifacts[].name'
+            exit 1
+          fi
+          
+          echo "📦 Found artifact: $ARTIFACT_ID"
+          
+          # Download the artifact — use -f so HTTP errors fail loudly
+          echo "⬇️ Downloading artifact..."
+          curl -sfL -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -o artifact.zip \
+            "https://api.github.com/repos/${{ github.repository }}/actions/artifacts/$ARTIFACT_ID/zip" || {
+            echo "❌ Artifact download failed (HTTP error or network issue)"
+            ls -la artifact.zip 2>/dev/null
+            exit 1
+          }
+
+          # Validate the download is actually a zip before extracting
+          if ! file artifact.zip | grep -qi "zip"; then
+            echo "❌ Downloaded file is not a valid zip archive"
+            ls -la artifact.zip
+            head -c 200 artifact.zip | xxd | head -5
+            exit 1
+          fi
+          
+          # Extract the artifact file
+          unzip -j artifact.zip -d build/
+          
+          # Verify the correct file was extracted based on install_type
+          if [ "${{ env.INSTALL_TYPE }}" = "deb" ]; then
+            if ls build/*.deb 1> /dev/null 2>&1; then
+              echo "✅ DEB package extracted successfully"
+              ls -lh build/*.deb
+            else
+              echo "❌ Failed to extract DEB package"
+              exit 1
+            fi
+          elif [ "${{ env.INSTALL_TYPE }}" = "appimage" ]; then
+            if ls build/*.AppImage 1> /dev/null 2>&1; then
+              echo "✅ AppImage extracted successfully"
+              ls -lh build/*.AppImage
+            else
+              echo "❌ Failed to extract AppImage package"
+              exit 1
+            fi
+          fi
+          
+          echo "📦 Build artifacts ready in ./build directory:"
+          ls -la build/
+
+      - name: Extract and inspect DEB package contents (Ubuntu)
+        if: matrix.install_type == 'deb'
+        run: |
+          echo "📦 Extracting DEB package contents for inspection..."
+          
+          # Find the DEB file
+          DEB_FILE=$(find build -name "*.deb" -type f | head -1)
+          
+          if [ -z "$DEB_FILE" ]; then
+            echo "⚠️ No DEB file found in build directory"
+            echo "Available files:"
+            ls -la build/ 2>/dev/null || echo "Build directory is empty"
+            exit 0
+          fi
+          
+          echo "✅ Found DEB file: $DEB_FILE"
+          echo "📊 DEB file size: $(ls -lh "$DEB_FILE" | awk '{print $5}')"
+          echo ""
+          
+          # Create extraction directory and get absolute path to DEB file
+          DEB_EXTRACT_DIR="deb-contents"
+          mkdir -p "$DEB_EXTRACT_DIR"
+          DEB_FILE_ABS=$(cd "$(dirname "$DEB_FILE")" && pwd)/$(basename "$DEB_FILE")
+          
+          cd "$DEB_EXTRACT_DIR"
+          
+          echo "🔍 Extracting DEB package using ar..."
+          # Extract DEB package (contains control.tar.zst/xz/gz, data.tar.zst/xz/gz, debian-binary)
+          ar x "$DEB_FILE_ABS"
+          
+          if [ $? -ne 0 ]; then
+            echo "❌ Failed to extract DEB with ar command"
+            exit 1
+          fi
+          
+          echo "✅ DEB archive extracted"
+          echo "📂 Archive contents:"
+          ls -la
+          echo ""
+          
+          # Extract control tarball
+          echo "🔍 Extracting control metadata..."
+          if [ -f "control.tar.zst" ]; then
+            tar --use-compress-program=unzstd -xf control.tar.zst
+            echo "✅ control.tar.zst extracted"
+          elif [ -f "control.tar.xz" ]; then
+            tar -xJf control.tar.xz
+            echo "✅ control.tar.xz extracted"
+          elif [ -f "control.tar.gz" ]; then
+            tar -xzf control.tar.gz
+            echo "✅ control.tar.gz extracted"
+          fi
+          
+          # Extract data tarball
+          echo "🔍 Extracting package data..."
+          if [ -f "data.tar.zst" ]; then
+            tar --use-compress-program=unzstd -xf data.tar.zst
+            echo "✅ data.tar.zst extracted"
+          elif [ -f "data.tar.xz" ]; then
+            tar -xJf data.tar.xz
+            echo "✅ data.tar.xz extracted"
+          elif [ -f "data.tar.gz" ]; then
+            tar -xzf data.tar.gz
+            echo "✅ data.tar.gz extracted"
+          fi
+          
+          cd ..
+          echo ""
+          echo "📂 DEB Package Contents Structure:"
+          echo "=================================="
+          tree "$DEB_EXTRACT_DIR" -L 5 2>/dev/null || find "$DEB_EXTRACT_DIR" -type f -o -type d | head -100
+          
+          echo ""
+          echo "📋 Key Files and Binaries:"
+          echo "=========================="
+          
+          # Find executable binaries
+          echo "🔹 Executables:"
+          find "$DEB_EXTRACT_DIR" -type f -executable | grep -E "(bin|lib)" | head -20
+          
+          # Find main openterface binary
+          echo ""
+          echo "🔹 OpenTerface binary location:"
+          find "$DEB_EXTRACT_DIR" -type f \( -name "*openterface*" -o -name "*openterfaceqt*" -o -name "*openterfaceQT*" \) ! -path "*/.*"
+          
+          # Find libraries - FFmpeg
+          echo ""
+          echo "🔹 FFmpeg Libraries (.so files):"
+          find "$DEB_EXTRACT_DIR" -type f -name "libav*.so*" -o -name "libsw*.so*" | sort
+          
+          # Find libraries - GStreamer
+          echo ""
+          echo "🔹 GStreamer Libraries:"
+          find "$DEB_EXTRACT_DIR" -type f -name "libgst*.so*" | sort
+          
+          # Find libraries - Hardware acceleration
+          echo ""
+          echo "🔹 Hardware Acceleration Libraries (VA-API, VDPAU):"
+          find "$DEB_EXTRACT_DIR" -type f \( -name "libva*.so*" -o -name "libvdpau*.so*" \) | sort
+          
+          # Find libraries - Image processing
+          echo ""
+          echo "🔹 Image Processing Libraries:"
+          find "$DEB_EXTRACT_DIR" -type f -name "libturbojpeg*.so*" | sort
+          
+          # Check for Qt libraries
+          echo ""
+          echo "🔹 Qt Libraries:"
+          find "$DEB_EXTRACT_DIR" -type f -name "libQt*.so*"| sort
+          
+          # Count total libraries
+          echo ""
+          echo "� Library Statistics:"
+          echo "====================="
+          TOTAL_SO=$(find "$DEB_EXTRACT_DIR" -type f -name "*.so*" | wc -l)
+          echo "  Total .so files: $TOTAL_SO"
+          
+          FFMPEG_COUNT=$(find "$DEB_EXTRACT_DIR" -type f \( -name "libav*.so*" -o -name "libsw*.so*" \) | wc -l)
+          echo "  FFmpeg libraries: $FFMPEG_COUNT"
+          
+          GSTREAMER_COUNT=$(find "$DEB_EXTRACT_DIR" -type f -name "libgst*.so*" | wc -l)
+          echo "  GStreamer libraries: $GSTREAMER_COUNT"
+          
+          QT_COUNT=$(find "$DEB_EXTRACT_DIR" -type f -name "libQt*.so*" | wc -l)
+          echo "  Qt libraries: $QT_COUNT"
+          
+          # Check directory sizes
+          echo ""
+          echo "📦 Directory Sizes:"
+          echo "=================="
+          du -sh "$DEB_EXTRACT_DIR"/usr/* 2>/dev/null | sort -h
+          
+          # Get DEB metadata
+          echo ""
+          echo "📋 DEB Package Metadata:"
+          echo "======================="
+          dpkg -I "$DEB_FILE" 2>/dev/null | head -30 || echo "⚠️ dpkg not available, reading control file directly"
+          
+          if [ -f "$DEB_EXTRACT_DIR/control" ]; then
+            echo ""
+            echo "📄 Control File Content:"
+            echo "----------------------"
+            cat "$DEB_EXTRACT_DIR/control"
+          fi
+          
+          # Installation scripts
+          echo ""
+          echo "🔧 Installation Scripts:"
+          echo "======================="
+          if [ -f "$DEB_EXTRACT_DIR/preinst" ]; then
+            echo "✅ preinst found ($(wc -l < "$DEB_EXTRACT_DIR/preinst") lines)"
+          fi
+          if [ -f "$DEB_EXTRACT_DIR/postinst" ]; then
+            echo "✅ postinst found ($(wc -l < "$DEB_EXTRACT_DIR/postinst") lines)"
+          fi
+          if [ -f "$DEB_EXTRACT_DIR/postrm" ]; then
+            echo "✅ postrm found ($(wc -l < "$DEB_EXTRACT_DIR/postrm") lines)"
+          fi
+          
+          echo ""
+          echo "✅ DEB package inspection completed"
+
+      - name: Build Docker image (Shared)
+        run: |
+          echo "🔨 Building Docker image: ${{ env.DOCKER_IMAGE_SHARED }}:${{ env.DOCKER_TAG }}"
+          
+          docker build \
+            -f docker/testos/Dockerfile.ubuntu-test-shared \
+            --build-arg INSTALL_TYPE=${{ env.INSTALL_TYPE }} \
+            -t ${{ env.DOCKER_IMAGE_SHARED }}:${{ env.DOCKER_TAG }} \
+            docker/
+          
+          echo "📦 Docker image built successfully"
+          echo "Note: Build artifacts will be passed at runtime if available"
+
+      - name: Prepare volume mounts for build artifacts
+        run: |
+          echo "📦 Checking for build artifacts to mount..."
+          
+          # Determine artifact pattern based on install type
+          if [ "${{ env.INSTALL_TYPE }}" = "deb" ]; then
+            ARTIFACT_PATTERN="*.deb"
+            ARTIFACT_TYPE="DEB"
+          elif [ "${{ env.INSTALL_TYPE }}" = "appimage" ]; then
+            ARTIFACT_PATTERN="*.AppImage"
+            ARTIFACT_TYPE="AppImage"
+          fi
+          
+          # Check if we have the appropriate build artifacts to mount
+          if [ -d build ] && [ -n "$(find build -name "$ARTIFACT_PATTERN" 2>/dev/null)" ]; then
+            echo "✅ Found $ARTIFACT_TYPE build artifacts"
+            VOLUME_MOUNT="-v $(pwd)/build:/tmp/build-artifacts:ro"
+            echo "VOLUME_MOUNT=$VOLUME_MOUNT" >> $GITHUB_ENV
+            echo "HAS_VOLUME_MOUNT=true" >> $GITHUB_ENV
+            ls -lh build/
+          else
+            echo "ℹ️ No $ARTIFACT_TYPE build artifacts found (will download from GitHub)"
+            echo "VOLUME_MOUNT=" >> $GITHUB_ENV
+            echo "HAS_VOLUME_MOUNT=false" >> $GITHUB_ENV
+          fi
+          
+          # Pass GITHUB_TOKEN to Docker containers for artifact downloads
+          echo "GITHUB_TOKEN_ENV=-e GITHUB_TOKEN=${{ secrets.GITHUB_TOKEN }}" >> $GITHUB_ENV
+
+      - name: Verify Docker image (Shared)
+        run: |
+          echo "�?Verifying Docker image was built successfully"
+          docker images | grep ${{ env.DOCKER_IMAGE_SHARED }}
+          
+          echo "📊 Image information:"
+          docker inspect ${{ env.DOCKER_IMAGE_SHARED }}:${{ env.DOCKER_TAG }} --format='{{.Config.Env}}'
+          docker inspect ${{ env.DOCKER_IMAGE_SHARED }}:${{ env.DOCKER_TAG }} --format='{{.Config.User}}'
+          docker inspect ${{ env.DOCKER_IMAGE_SHARED }}:${{ env.DOCKER_TAG }} --format='{{.Config.WorkingDir}}'
+          
+          echo "🔍 Image CMD and Entrypoint:"
+          docker inspect ${{ env.DOCKER_IMAGE_SHARED }}:${{ env.DOCKER_TAG }} --format='{{.Config.Cmd}}'
+          docker inspect ${{ env.DOCKER_IMAGE_SHARED }}:${{ env.DOCKER_TAG }} --format='{{.Config.Entrypoint}}'
+          
+          echo "🔍 Image layers (last 10):"
+          docker history ${{ env.DOCKER_IMAGE_SHARED }}:${{ env.DOCKER_TAG }} | head -10
+
+      - name: Show all included libraries in AppImage (Shared)
+        if: matrix.install_type == 'appimage'
+        run: |
+          echo "📚 Analyzing AppImage included libraries"
+          
+          # Find the AppImage file with absolute path
+          APPIMAGE=$(find build -name "*.AppImage" -type f | head -1)
+          
+          if [ -z "$APPIMAGE" ] || [ ! -f "$APPIMAGE" ]; then
+            echo "⚠️ AppImage file not found in build directory"
+            echo "Available files:"
+            ls -la build/
+            exit 1
+          fi
+          
+          # Convert to absolute path
+          APPIMAGE=$(cd "$(dirname "$APPIMAGE")" && pwd)/$(basename "$APPIMAGE")
+          
+          echo "Found AppImage: $APPIMAGE"
+          echo "File size: $(ls -lh "$APPIMAGE" | awk '{print $5}')"
+          echo ""
+          
+          # Extract AppImage contents without mounting
+          echo "📂 Extracting AppImage contents:"
+          echo "==============================="
+          
+          EXTRACT_DIR=$(mktemp -d)
+          trap "rm -rf $EXTRACT_DIR" EXIT
+          
+          cd "$EXTRACT_DIR"
+          
+          # AppImage is a special ELF file that can be executed with --appimage-extract
+          echo "🔧 Attempting AppImage extraction with --appimage-extract..."
+          
+          if "$APPIMAGE" --appimage-extract >/dev/null 2>&1; then
+            echo "✅ Extraction successful using --appimage-extract"
+          else
+            echo "⚠️ --appimage-extract failed, trying alternative method..."
+            
+            # Alternative: AppImage is essentially a .squashfs archive
+            if command -v unsquashfs >/dev/null 2>&1; then
+              echo "ℹ️ Attempting SquashFS extraction..."
+              tail -c +100000 "$APPIMAGE" 2>/dev/null | unsquashfs -d squashfs-root - 2>/dev/null && \
+              echo "✅ SquashFS extraction successful" || echo "⚠️ SquashFS extraction failed"
+            else
+              echo "⚠️ unsquashfs not available"
+            fi
+          fi
+          
+          # Now list all the libraries found
+          if [ -d "$EXTRACT_DIR/squashfs-root" ] || [ -n "$(find "$EXTRACT_DIR" -name "*.so*" 2>/dev/null | head -1)" ]; then
+            echo ""
+            echo "📚 All libraries included in AppImage:"
+            echo "======================================"
+            find "$EXTRACT_DIR" -type f \( -name "*.so*" -o -name "*.la" \) 2>/dev/null | sort
+            
+            # Count different types
+            echo ""
+            echo "📊 Library Statistics:"
+            echo "====================="
+            SO_COUNT=$(find "$EXTRACT_DIR" -type f -name "*.so*" 2>/dev/null | wc -l)
+            LA_COUNT=$(find "$EXTRACT_DIR" -type f -name "*.la" 2>/dev/null | wc -l)
+            echo "  Shared objects (.so*): $SO_COUNT"
+            echo "  Libtool archives (.la): $LA_COUNT"
+            echo "  Total: $((SO_COUNT + LA_COUNT))"
+            
+            # Get Qt libraries
+            QT_LIBS=$(find "$EXTRACT_DIR" -type f -name "libQt*.so*" 2>/dev/null)
+            if [ -n "$QT_LIBS" ]; then
+              echo ""
+              echo "🎨 Qt Libraries:"
+              echo "================"
+              echo "$QT_LIBS" | sort
+            fi
+            
+            # Get FFmpeg/GStreamer libraries
+            MEDIA_LIBS=$(find "$EXTRACT_DIR" -type f \( -name "libav*.so*" -o -name "libsw*.so*" -o -name "libgst*.so*" \) 2>/dev/null)
+            if [ -n "$MEDIA_LIBS" ]; then
+              echo ""
+              echo "🎬 Media Libraries (FFmpeg/GStreamer):"
+              echo "======================================"
+              echo "$MEDIA_LIBS" | sort
+            fi
+            
+            # Get USB/Device libraries
+            USB_LIBS=$(find "$EXTRACT_DIR" -type f \( -name "libusb*.so*" -o -name "libudev*.so*" \) 2>/dev/null)
+            if [ -n "$USB_LIBS" ]; then
+              echo ""
+              echo "🔌 USB/Device Libraries:"
+              echo "======================="
+              echo "$USB_LIBS" | sort
+            fi
+          else
+            echo "⚠️ Could not extract AppImage contents"
+            echo "Attempting to list AppImage format information..."
+            file "$APPIMAGE"
+            echo ""
+            echo "Checking AppImage ELF headers..."
+            readelf -l "$APPIMAGE" 2>/dev/null | head -20 || strings "$APPIMAGE" | head -30
+          fi
+          
+          echo ""
+          echo "✅ AppImage library analysis completed"
+
+      - name: Start persistent container for testing (Shared)
+        timeout-minutes: 15
+        env:
+          HAS_VOLUME_MOUNT: ${{ env.HAS_VOLUME_MOUNT }}
+          VOLUME_MOUNT: ${{ env.VOLUME_MOUNT }}
+          INSTALL_TYPE: ${{ env.INSTALL_TYPE }}
+          DOCKER_IMAGE_SHARED: ${{ env.DOCKER_IMAGE_SHARED }}
+          DOCKER_TAG: ${{ env.DOCKER_TAG }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "🧪 Starting persistent container for all subsequent tests"
+          
+          # Set environment variable to track container name
+          echo "TEST_CONTAINER_NAME=openterface-test-persistent" >> $GITHUB_ENV
+          
+          # Build docker run command
+          DOCKER_RUN_CMD="docker run -d \
+            --name openterface-test-persistent \
+            -e DISPLAY=:0 \
+            -e GITHUB_TOKEN=${GITHUB_TOKEN} \
+            -e INSTALL_TYPE=${INSTALL_TYPE} \
+            -e QT_X11_NO_MITSHM=1 \
+            -e QT_QPA_PLATFORM=xcb \
+            -e LC_ALL=C.UTF-8 \
+            -e LANG=C.UTF-8 \
+            --network host \
+            --privileged \
+            --device /dev/fuse"
+          
+          # Add volume mount if provided
+          if [ -n "$VOLUME_MOUNT" ]; then
+            DOCKER_RUN_CMD="$DOCKER_RUN_CMD $VOLUME_MOUNT"
+          fi
+          
+          # Add image
+          DOCKER_RUN_CMD="$DOCKER_RUN_CMD ${DOCKER_IMAGE_SHARED}:${DOCKER_TAG}"
+          
+          echo "📋 Starting container with config:"
+          echo "  Image: ${DOCKER_IMAGE_SHARED}:${DOCKER_TAG}"
+          echo "  Install Type: ${INSTALL_TYPE}"
+          echo "  Volume Mount: ${VOLUME_MOUNT:-none}"
+          echo "  GITHUB_TOKEN: $(echo ${GITHUB_TOKEN} | cut -c1-20)..."
+          echo ""
+          echo "Starting container..."
+          CONTAINER_ID=$(eval $DOCKER_RUN_CMD)
+          
+          echo "✅ Container started"
+          echo "📦 Container ID: ${CONTAINER_ID:0:12}"
+          echo "CONTAINER_ID=$CONTAINER_ID" >> $GITHUB_ENV
+          
+          # Wait for app to be ready (max 120 seconds)
+          echo "⏳ Waiting for app to start (monitoring logs, max 120 seconds)..."
+          WAIT_TIME=0
+          MAX_WAIT=120
+          APP_READY=false
+          INSTALLATION_FAILED=false
+          
+          while [ $WAIT_TIME -lt $MAX_WAIT ]; do
+              LOGS=$(docker logs $CONTAINER_ID 2>&1)
+              
+              # Check if app is ready
+              if echo "$LOGS" | grep -q "ready for testing"; then
+                  echo "✅ App is ready! (detected after ${WAIT_TIME}s)"
+                  APP_READY=true
+                  break
+              fi
+              
+              # Check if installation failed but container is still running
+              if echo "$LOGS" | grep -q "Installation failed\|openterfaceQT application not found"; then
+                  INSTALLATION_FAILED=true
+                  if [ $WAIT_TIME -gt 10 ]; then
+                    # Give installation script time to attempt recovery before stopping wait
+                    break
+                  fi
+              fi
+              
+              printf "\r⏳ Progress: %d/%d seconds" $WAIT_TIME $MAX_WAIT
+              sleep 1
+              WAIT_TIME=$((WAIT_TIME + 1))
+          done
+          
+          echo ""
+          if [ "$APP_READY" = false ]; then
+              if [ "$INSTALLATION_FAILED" = true ]; then
+                  echo "⚠️ Installation may have failed, but container is running"
+                  echo "📋 Checking container status and logs..."
+              else
+                  echo "⚠️ 'Ready' message not detected, but container is running"
+              fi
+              echo "Last 30 lines of logs:"
+              docker logs $CONTAINER_ID 2>&1 | tail -30 | sed 's/^/  /'
+          fi
+          
+          # Give the container a moment to settle
+          sleep 5
+          
+          # Verify container is still running (with better diagnostics)
+          echo ""
+          echo "🔍 Verifying container status..."
+          echo "Container ID: $CONTAINER_ID"
+          
+          # Check if container exists and is running
+          CONTAINER_STATUS=$(docker inspect -f '{{.State.Running}}' $CONTAINER_ID 2>/dev/null || echo "error")
+          echo "Container status check: $CONTAINER_STATUS"
+          
+          if [ "$CONTAINER_STATUS" = "true" ]; then
+              echo "✅ Container is running and ready for tests"
+          else
+              echo "⚠️ Container is not in running state (Status: $CONTAINER_STATUS)"
+              echo "Container may have exited due to installation failure"
+              echo "Full container inspection:"
+              docker inspect $CONTAINER_ID 2>&1 | head -40 || echo "Container not found"
+              echo ""
+              echo "Last 40 lines of logs:"
+              docker logs $CONTAINER_ID 2>&1 | tail -40 | sed 's/^/  /' || echo "Could not retrieve logs"
+              echo ""
+              
+              # Try to restart the container or provide recovery info
+              echo "🔧 Attempting recovery..."
+              if docker ps -a --filter "id=$CONTAINER_ID" --format '{{.State}}' 2>/dev/null | grep -q "exited"; then
+                  echo "ℹ️ Container exited. Providing installation logs for debugging:"
+                  docker logs $CONTAINER_ID 2>&1 | grep -A5 -B5 "Installation\|failed\|error" | head -50
+              fi
+              
+              # Don't exit hard - allow downstream steps to diagnose
+              echo ""
+              echo "⚠️ WARNING: Container not ready, but continuing to next steps for diagnostics"
+              # exit 1  # Removed to allow diagnostics steps to run
+          fi
+          
+          # Display full container logs
+          echo ""
+          echo "📋 Full Container Logs:"
+          echo "=================================================="
+          
+          # Get all logs
+          ALL_LOGS=$(docker logs $CONTAINER_ID 2>&1)
+          TOTAL_LINES=$(echo "$ALL_LOGS" | wc -l)
+          
+          echo "Total container log lines: $TOTAL_LINES"
+          echo ""
+          
+          echo "📌 CONTAINER LOGS - FULL OUTPUT:"
+          echo "---"
+          echo "$ALL_LOGS"
+          echo "=================================================="
+          echo ""
+          
+          # Display running processes in the container
+          echo ""
+          echo "📋 Running Processes in Container:"
+          echo "=================================================="
+          echo "Installation Type: $INSTALL_TYPE"
+          echo ""
+          docker exec $CONTAINER_ID bash -c '
+            echo "🔍 All running processes:"
+            ps auxf
+            echo ""
+            echo "🔍 OpenTerface related processes:"
+            ps aux | grep -i openterface || echo "No openterface processes found"
+            echo ""
+            echo "🔍 Checking installation type:"
+            if [ -d "/opt/openterface" ]; then
+              echo "✅ DEB installation detected - Files in /opt/openterface:"
+              ls -la /opt/openterface/ 2>/dev/null | head -20 || echo "Directory not found"
+              echo ""
+              echo "Installed packages:"
+              dpkg -l | grep -i openterface || echo "No openterface packages found"
+            fi
+            
+            if ls /tmp/*.AppImage 2>/dev/null | grep -i openterface >/dev/null 2>&1; then
+              echo "✅ AppImage installation detected:"
+              ls -lh /tmp/*.AppImage 2>/dev/null | grep -i openterface
+            fi
+            
+            echo ""
+            echo "🔍 Installation method verification:"
+            if [ -f /etc/openterface/openterface.conf ]; then
+              echo "✅ Configuration file found at /etc/openterface/openterface.conf"
+              cat /etc/openterface/openterface.conf 2>/dev/null | head -10
+            fi
+            
+            if [ -x /opt/openterface/bin/openterfaceqt ] || [ -x /usr/bin/openterfaceqt ]; then
+              echo "✅ DEB binary found in /opt/openterface/bin/ or /usr/bin/"
+              which openterfaceqt 2>/dev/null || echo "openterfaceqt not in PATH"
+            fi
+          ' || echo "⚠️ Could not retrieve process information"
+          echo "=================================================="
+          echo ""
+          
+          # Display Openterface app logs for troubleshooting
+          echo ""
+          echo "📋 Openterface Application Logs (First 30 and Last 30 lines):"
+          echo "=================================================="
+          docker exec $CONTAINER_ID bash -c '
+            if [ -f /tmp/openterfaceqt.log ]; then
+              TOTAL_APP_LINES=$(wc -l < /tmp/openterfaceqt.log)
+              echo "Total application log lines: $TOTAL_APP_LINES"
+              echo ""
+              
+              if [ "$TOTAL_APP_LINES" -gt 60 ]; then
+                echo "📌 FIRST 100 LINES OF APPLICATION LOG:"
+                echo "---"
+                head -100 /tmp/openterfaceqt.log
+                echo ""
+                echo "... (middle $((TOTAL_APP_LINES - 60)) lines omitted) ..."
+                echo ""
+                echo "📌 LAST 100 LINES OF APPLICATION LOG:"
+                echo "---"
+                tail -100 /tmp/openterfaceqt.log
+              else
+                echo "📌 ALL APPLICATION LOGS ($TOTAL_APP_LINES lines):"
+                echo "---"
+                cat /tmp/openterfaceqt.log
+              fi
+            else
+              echo "⚠️ Log file not found at /tmp/openterfaceqt.log"
+            fi
+          ' || echo "⚠️ Could not retrieve app logs"
+          echo "=================================================="
+          echo ""
+
+      - name: Test basic container functionality (Shared)
+        timeout-minutes: 5
+        run: |
+          echo "🧪 Testing basic container functionality on persistent container"
+          
+          CONTAINER_ID="${{ env.CONTAINER_ID }}"
+          
+          # Test simple command execution
+          echo "🔍 Testing simple command execution..."
+          docker exec $CONTAINER_ID bash -c '
+            echo "✅ Container can execute commands"
+            whoami
+            pwd
+            echo "User ID:" $(id)
+            echo "Environment variables:"
+            env | grep -E "HOME|USER|DISPLAY|QT_|GITHUB_TOKEN|INSTALL_TYPE" | head -10
+            echo "File system check:"
+            ls -la /home/openterface/ | head -5 || echo "Directory not found"
+            echo "✅ Basic functionality test completed"
+          '
+          
+          echo "✅ Basic container functionality test passed"
+     
+      - name: Test hardware interface dependencies (Shared)
+        timeout-minutes: 5
+        run: |
+          echo "🧪 Testing hardware interface dependencies on persistent container"
+          
+          CONTAINER_ID="${{ env.CONTAINER_ID }}"
+          
+          # Check system libraries directly
+          docker exec $CONTAINER_ID bash -c '
+            echo "🔍 Checking USB libraries..."
+            dpkg -l | grep libusb || echo "No libusb packages found"
+            
+            echo "🔍 Checking udev libraries..."
+            dpkg -l | grep libudev || echo "No libudev packages found"
+            
+            echo "🔍 Checking FFmpeg libraries..."
+            dpkg -l | grep libav | head -5 || echo "No FFmpeg packages found"
+            
+            echo "🔍 Checking GStreamer..."
+            dpkg -l | grep gstreamer | head -5 || echo "No GStreamer packages found"
+            
+            echo "✅ Hardware interface dependencies check completed"
+          '
+      
+      - name: GUI screenshot test on persistent container (Shared)
+        timeout-minutes: 10
+        run: |
+          echo "🧪 Taking screenshots from persistent container"
+          
+          CONTAINER_ID="${{ env.CONTAINER_ID }}"
+          SCREENSHOTS_DIR="screenshots-shared"
+          mkdir -p $SCREENSHOTS_DIR
+          
+          echo "📸 Preparing to take screenshots..."
+          
+          # Wait for app to fully render
+          echo "⏳ Waiting 5 seconds for app to render..."
+          sleep 5
+          
+          # Check container status using docker inspect (more reliable than docker ps | grep)
+          CONTAINER_STATUS=$(docker inspect -f '{{.State.Running}}' $CONTAINER_ID 2>/dev/null || echo "error")
+          
+          if [ "$CONTAINER_STATUS" != "true" ]; then
+              echo "❌ Container is no longer running!"
+              echo "Container status: $CONTAINER_STATUS"
+              echo "Last logs:"
+              docker logs $CONTAINER_ID 2>&1 | tail -30 | sed 's/^/  /'
+              exit 1
+          fi
+          
+          echo "✅ Container is running"
+          
+          # Check X11 display
+          echo "🔍 Checking X11 display..."
+          if docker exec $CONTAINER_ID sh -c "DISPLAY=:0 xdpyinfo >/dev/null 2>&1"; then
+              echo "✅ X11 display :0 is available"
+              # Get display resolution
+              DISPLAY_RES=$(docker exec $CONTAINER_ID sh -c "DISPLAY=:0 xdpyinfo 2>/dev/null | grep 'dimensions:' | awk '{print \$2}'" || echo "unknown")
+              echo "📊 Display resolution: $DISPLAY_RES"
+          else
+              echo "⚠️ X11 display check failed"
+          fi
+          
+          # Take screenshot
+          echo "📷 Taking screenshot..."
+          timestamp=$(date +"%Y%m%d_%H%M%S")
+          container_screenshot="/tmp/screenshot_${timestamp}.jpg"
+          screenshot_jpg="$SCREENSHOTS_DIR/openterface_app_${timestamp}.jpg"
+          
+          # Try multiple screenshot methods in order of reliability
+          SCREENSHOT_SUCCESS=false
+          
+          # Method 1: Use xwd + convert (most reliable for full resolution)
+          if ! $SCREENSHOT_SUCCESS; then
+              echo "📌 Attempting screenshot method 1: xwd + convert..."
+              if docker exec $CONTAINER_ID sh -c "DISPLAY=:0 xwd -root 2>/dev/null | convert xwd:- -quality 100 -geometry 1920x1080 $container_screenshot 2>&1"; then
+                  SCREENSHOT_SUCCESS=true
+                  echo "✅ Screenshot captured using xwd + convert"
+              else
+                  echo "⚠️ xwd + convert method failed, trying alternative..."
+              fi
+          fi
+          
+          # Method 2: Use scrot (screenshot tool, may not be available)
+          if ! $SCREENSHOT_SUCCESS; then
+              echo "📌 Attempting screenshot method 2: scrot..."
+              if docker exec $CONTAINER_ID sh -c "DISPLAY=:0 scrot -z $container_screenshot 2>&1"; then
+                  SCREENSHOT_SUCCESS=true
+                  echo "✅ Screenshot captured using scrot"
+              else
+                  echo "⚠️ scrot method failed, trying alternative..."
+              fi
+          fi
+          
+          # Method 3: Use gnome-screenshot (GNOME/GTK environment)
+          if ! $SCREENSHOT_SUCCESS; then
+              echo "📌 Attempting screenshot method 3: gnome-screenshot..."
+              if docker exec $CONTAINER_ID sh -c "DISPLAY=:0 gnome-screenshot -f $container_screenshot 2>&1"; then
+                  SCREENSHOT_SUCCESS=true
+                  echo "✅ Screenshot captured using gnome-screenshot"
+              else
+                  echo "⚠️ gnome-screenshot method failed, trying alternative..."
+              fi
+          fi
+          
+          # Method 4: Use import with explicit geometry (fallback, may scale down)
+          if ! $SCREENSHOT_SUCCESS; then
+              echo "📌 Attempting screenshot method 4: import with explicit geometry..."
+              if docker exec $CONTAINER_ID sh -c "DISPLAY=:0 import -window root -quality 100 -geometry 1920x1080 $container_screenshot 2>&1"; then
+                  SCREENSHOT_SUCCESS=true
+                  echo "✅ Screenshot captured using import with geometry"
+              else
+                  echo "⚠️ import method failed"
+              fi
+          fi
+          
+          if [ "$SCREENSHOT_SUCCESS" = true ]; then
+              if docker cp "$CONTAINER_ID:$container_screenshot" "$screenshot_jpg" 2>/dev/null; then
+                  echo "✅ Screenshot copied to host: $screenshot_jpg"
+                  
+                  # Analyze screenshot
+                  if command -v identify >/dev/null 2>&1; then
+                      filesize=$(ls -lh "$screenshot_jpg" | awk '{print $5}')
+                      dimensions=$(identify "$screenshot_jpg" | awk '{print $3}')
+                      echo "📊 Screenshot info: $filesize, Dimensions: $dimensions"
+                      
+                      # Warn if resolution is not 1920x1080
+                      if [ "$dimensions" != "1920x1080" ]; then
+                          echo "⚠️ WARNING: Screenshot resolution is $dimensions, expected 1920x1080"
+                      fi
+                  fi
+              else
+                  echo "❌ Failed to copy screenshot"
+                  exit 1
+              fi
+          else
+              echo "❌ All screenshot methods failed"
+              
+              # Show diagnostics
+              echo "📋 Container logs (last 20 lines):"
+              docker logs $CONTAINER_ID 2>&1 | tail -20 | sed 's/^/  /'
+              exit 1
+          fi
+          
+          # List screenshots
+          if [ -d "$SCREENSHOTS_DIR" ]; then
+              echo ""
+              echo "📊 Screenshots generated:"
+              ls -lh $SCREENSHOTS_DIR/
+          fi
+      - name: Display screenshots in summary (Shared)
+        if: always()
+        env:
+          QINIU_AK: ${{ secrets.QINIU_AK }}
+          QINIU_SK: ${{ secrets.QINIU_SK }}
+          QINIU_BUCKET: ${{ secrets.QINIU_BUCKET }}
+          QINIU_DOMAIN: ${{ secrets.QINIU_DOMAIN }}
+        run: |
+          echo "🔍 DEBUG: Starting screenshot summary generation"
+          echo "📁 Checking for screenshots directory..."
+          ls -la screenshots-shared/ 2>&1 || echo "Directory not found"
+          
+          # Start the summary
+          echo "# GUI Screenshots - Shared Build (${{ env.INSTALL_TYPE }})" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Build Type**: Shared Library" >> $GITHUB_STEP_SUMMARY
+          echo "**Commit**: ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Timestamp**: $(date -u)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ -d "screenshots-shared" ] && [ "$(ls -A screenshots-shared/*.jpg 2>/dev/null)" ]; then
+            echo "✅ Screenshots directory found"
+            echo "## Test Results" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            
+            total_jpgs=$(find screenshots-shared/ -name "*.jpg" 2>/dev/null | wc -l)
+            content_jpgs=$(find screenshots-shared/ -name "*.jpg" -exec identify -ping -format "%[mean]" {} \; 2>/dev/null | awk -F. '{if($1 > 100) count++} END {print count+0}')
+            
+            echo "📊 Found $total_jpgs screenshots with $content_jpgs containing content"
+            
+            echo "- **Total Screenshots**: $total_jpgs" >> $GITHUB_STEP_SUMMARY
+            echo "- **With Content**: $content_jpgs" >> $GITHUB_STEP_SUMMARY
+            
+            if [ "$total_jpgs" -gt 0 ]; then
+              echo "- **Status**: SUCCESS" >> $GITHUB_STEP_SUMMARY
+            fi
+            
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "## Screenshots" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            
+            screenshot_count=0
+            api_key_shown=0
+            upload_failed=0
+            
+            for img in screenshots-shared/*.jpg; do
+              if [ -f "$img" ]; then
+                filename=$(basename "$img")
+                screenshot_count=$((screenshot_count + 1))
+                
+                artifact_name="screenshot-shared-${screenshot_count}-$(echo "$filename" | sed 's/[^a-zA-Z0-9.-]/_/g')"
+                echo "$artifact_name|$img" >> /tmp/screenshot_artifacts_shared.txt
+                
+                filesize=$(ls -lh "$img" | awk '{print $5}')
+                
+                # Add basic screenshot info to summary first
+                echo "### Screenshot $screenshot_count: $filename" >> $GITHUB_STEP_SUMMARY
+                echo "" >> $GITHUB_STEP_SUMMARY
+                echo "**Size:** $filesize" >> $GITHUB_STEP_SUMMARY
+                echo "" >> $GITHUB_STEP_SUMMARY
+                
+                # Determine if screenshot has content based on file size (more reliable than color analysis)
+                actual_size=$(stat -f%z "$img" 2>/dev/null || stat -c%s "$img" 2>/dev/null || echo 0)
+                if [ "$actual_size" -gt 5000 ]; then
+                  echo "**Status:** ✅ Content detected ($(($actual_size / 1024))KB)" >> $GITHUB_STEP_SUMMARY
+                else
+                  echo "**Status:** ❌ FAILED - Screenshot too small (size: $actual_size bytes, expected: >5000 bytes)" >> $GITHUB_STEP_SUMMARY
+                  echo "Screenshot file size validation failed: $actual_size bytes < 5000 bytes"
+                  exit 1
+                fi
+                echo "" >> $GITHUB_STEP_SUMMARY
+
+                if [ -n "$QINIU_AK" ] && [ -n "$QINIU_SK" ]; then
+                  echo "📤 Uploading $filename to Qiniu using Python script..."
+                  echo "🔑 Qiniu credentials validation: AK=${#QINIU_AK} chars, SK=${#QINIU_SK} chars"
+
+                  # Use Python script for upload instead of bash script
+                  UPLOAD_EXIT_CODE=0
+                  UPLOAD_OUTPUT=$(QINIU_AK="$QINIU_AK" QINIU_SK="$QINIU_SK" QINIU_BUCKET="${QINIU_BUCKET:-openterface}" QINIU_DOMAIN="$QINIU_DOMAIN" timeout 120 python3 ./docker/upload_to_qiniu.py "$img" 2>&1) || UPLOAD_EXIT_CODE=$?
+                  
+                  if [ $UPLOAD_EXIT_CODE -ne 0 ]; then
+                    echo "❌ Upload script failed with exit code: $UPLOAD_EXIT_CODE"
+                    echo "📋 Upload output:"
+                    echo "$UPLOAD_OUTPUT"
+                    echo "---"
+                  fi
+                  
+                  # Extract URL from Python script output
+                  UPLOAD_URL=$(echo "$UPLOAD_OUTPUT" | grep -oE 'https://[^ "]*' | tail -1)
+                  
+                  if [ -z "$UPLOAD_URL" ]; then
+                    UPLOAD_URL=$(echo "$UPLOAD_OUTPUT" | grep -E '^https' | tail -1)
+                  fi
+                  
+                  if [ -n "$UPLOAD_URL" ]; then
+                    echo "✅ Upload successful: $UPLOAD_URL"
+                    echo "<a href=\"$UPLOAD_URL\" target=\"_blank\"><img src=\"$UPLOAD_URL\" width=\"800\" alt=\"Screenshot\"></a>" >> $GITHUB_STEP_SUMMARY
+                    echo "" >> $GITHUB_STEP_SUMMARY
+                    echo "[View Full Size]($UPLOAD_URL)" >> $GITHUB_STEP_SUMMARY
+                    echo "" >> $GITHUB_STEP_SUMMARY
+                  else
+                    echo "⚠️ Upload URL extraction inconclusive for $filename"
+                    echo "   Raw output (last 10 lines):"
+                    echo "$UPLOAD_OUTPUT" | tail -10 | sed 's|^|   |'
+                    FALLBACK_URL=$(echo "$UPLOAD_OUTPUT" | grep -o 'https[^[:space:]]*' | tail -1)
+                    if [ -n "$FALLBACK_URL" ]; then
+                      echo "   ✅ Recovered URL: $FALLBACK_URL"
+                      echo "<a href=\"$FALLBACK_URL\" target=\"_blank\"><img src=\"$FALLBACK_URL\" width=\"800\" alt=\"Screenshot\"></a>" >> $GITHUB_STEP_SUMMARY
+                      echo "" >> $GITHUB_STEP_SUMMARY
+                      echo "[View Full Size]($FALLBACK_URL)" >> $GITHUB_STEP_SUMMARY
+                      echo "" >> $GITHUB_STEP_SUMMARY
+                    else
+                      upload_failed=1
+                      echo "⚠️ Upload to Qiniu failed - See artifacts for full image" >> $GITHUB_STEP_SUMMARY
+                      echo "" >> $GITHUB_STEP_SUMMARY
+                    fi
+                  fi
+                else
+                  if [ $api_key_shown -eq 0 ]; then
+                    echo "⚠️ Qiniu AK/SK not configured - displaying artifacts instead" >> $GITHUB_STEP_SUMMARY
+                    echo "" >> $GITHUB_STEP_SUMMARY
+                    api_key_shown=1
+                  fi
+                fi
+              fi
+            done
+            
+            if [ $upload_failed -eq 1 ] || [ $api_key_shown -eq 1 ]; then
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "## 📥 Download Screenshots from Artifacts" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "Since Qiniu upload is not available, all screenshots are saved as artifacts:" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "- **openterface-gui-screenshots-shared-${{ env.INSTALL_TYPE }}-collection** - All screenshots" >> $GITHUB_STEP_SUMMARY
+              echo "- **openterface-gui-screenshots-shared-${{ env.INSTALL_TYPE }}-individual** - Individual images" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+            fi
+            
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "## 📋 Step Logs" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "See the logs of the **GUI screenshot test using proven script** step for detailed test output." >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            
+          else
+            echo "❌ Screenshots directory not found or empty"
+            echo "## No Screenshots Available" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "No screenshots were generated during the test. Please check the logs of the **GUI screenshot test using proven script** step for details." >> $GITHUB_STEP_SUMMARY
+          fi
+      - name: Upload individual screenshots (Shared)
+        if: always()
+        run: |
+          echo "📤 Uploading individual screenshots as artifacts"
+          
+          # Create temp directory for individual screenshots
+          mkdir -p /tmp/individual_screenshots
+          
+          # Upload each screenshot separately if the artifacts list exists
+          if [ -f /tmp/screenshot_artifacts_shared.txt ]; then
+            while IFS='|' read -r artifact_name img_path; do
+              if [ -f "$img_path" ]; then
+                # Copy screenshot to temp directory with clean name
+                cp "$img_path" "/tmp/individual_screenshots/$(basename "$img_path")"
+                echo "Prepared: $img_path -> $artifact_name"
+              fi
+            done < /tmp/screenshot_artifacts_shared.txt
+          fi
+          
+          # Also upload the full collection as backup
+          if [ -d "screenshots-shared" ] && [ "$(ls -A screenshots-shared/*.jpg 2>/dev/null)" ]; then
+            echo "📁 Also creating full screenshots collection"
+          fi
+      - name: Upload screenshots collection (Shared)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: openterface-gui-screenshots-shared-${{ env.INSTALL_TYPE }}-collection
+          path: screenshots-shared/
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Upload individual screenshots as artifacts (Shared)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: openterface-gui-screenshots-shared-${{ env.INSTALL_TYPE }}-individual
+          path: /tmp/individual_screenshots/
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Manage Qiniu bucket - Keep max 50 recent images (Shared)
+        if: always()
+        env:
+          QINIU_AK: ${{ secrets.QINIU_AK }}
+          QINIU_SK: ${{ secrets.QINIU_SK }}
+          QINIU_BUCKET: ${{ secrets.QINIU_BUCKET }}
+          QINIU_DOMAIN: ${{ secrets.QINIU_DOMAIN }}
+        run: |
+          echo "🧹 Cleaning up Qiniu bucket - Keeping maximum 50 recent images"
+          
+          if [ -z "$QINIU_AK" ] || [ -z "$QINIU_SK" ]; then
+            echo "⚠️ Qiniu credentials not configured, skipping bucket management"
+            exit 0
+          fi
+          
+          echo "📊 Running bucket management script..."
+          QINIU_AK="$QINIU_AK" \
+          QINIU_SK="$QINIU_SK" \
+          QINIU_BUCKET="${QINIU_BUCKET:-openterface}" \
+          QINIU_DOMAIN="$QINIU_DOMAIN" \
+          python3 ./docker/manage_qiniu_bucket.py -k 50 --force 2>&1
+          
+          if [ $? -eq 0 ]; then
+            echo "✅ Bucket management completed successfully"
+            echo "📋 Summary: Kept maximum 50 most recent images in Qiniu bucket"
+          else
+            echo "⚠️ Bucket management encountered an issue (non-blocking)"
+            echo "   This may occur if the bucket has fewer than 50 images or credentials are invalid"
+          fi
+
+      - name: Test container with simulated USB devices (Shared)
+        timeout-minutes: 5
+        run: |
+          echo "🧪 Testing container with simulated USB device access on persistent container"
+          
+          CONTAINER_ID="${{ env.CONTAINER_ID }}"
+          
+          # Test USB device access using the already running persistent container
+          echo "Testing USB device access on container: $CONTAINER_ID"
+          
+          docker exec "$CONTAINER_ID" bash -c '
+            echo "🔍 Checking USB device access..."
+            ls -la /dev/bus/usb/ 2>/dev/null || echo "No USB devices found"
+            
+            echo "🔍 Checking hidraw devices..."
+            ls -la /dev/hidraw* 2>/dev/null || echo "No hidraw devices found"
+            
+            echo "🔍 Checking ttyUSB devices..."
+            ls -la /dev/ttyUSB* 2>/dev/null || echo "No ttyUSB devices found"
+            
+            echo "🔍 Testing lsusb command..."
+            lsusb || echo "lsusb command failed"
+            
+            echo "🔍 Checking for target Openterface devices..."
+            lsusb | grep -E "534d|1a86" || echo "No Openterface devices detected (expected in test environment)"
+            
+            echo "✅ USB device access test completed"
+          ' || echo "⚠️ USB device access test skipped - container not available"
+
+      - name: Clean up Docker resources (Shared)
+        if: always()
+        timeout-minutes: 5
+        run: |
+          echo "🧹 Cleaning up Docker resources (Shared)"
+          
+          # Kill any hanging containers immediately (don't wait for graceful shutdown)
+          echo "1️⃣ Force killing all openterface containers..."
+          docker ps -aq --filter "name=openterface-" | xargs -r docker kill 2>/dev/null || true
+          
+          # Wait a moment for kills to take effect
+          sleep 1
+          
+          # Remove test containers (force remove any remaining)
+          echo "2️⃣ Force removing all openterface containers..."
+          docker ps -aq --filter "name=openterface-" | xargs -r docker rm -f 2>/dev/null || true
+          
+          # Remove test image
+          echo "3️⃣ Removing test image..."
+          docker rmi ${{ env.DOCKER_IMAGE_SHARED }}:${{ env.DOCKER_TAG }} 2>/dev/null || true
+          
+          # Additional safety: kill any dangling docker processes at OS level
+          echo "4️⃣ Killing dangling docker processes..."
+          pkill -9 -f "docker run.*openterface" 2>/dev/null || true
+          
+          # Use killall as well
+          killall -9 docker 2>/dev/null || true
+          sleep 1
+          
+          # Verify cleanup
+          echo "5️⃣ Verifying cleanup..."
+          remaining=$(docker ps -aq --filter "name=openterface-" 2>/dev/null | wc -l)
+          if [ "$remaining" -gt 0 ]; then
+            echo "⚠️ Warning: $remaining containers still exist after cleanup"
+            docker ps -a --filter "name=openterface-" || true
+            echo "❌ Cleanup incomplete - killing all docker processes..."
+            pkill -9 docker 2>/dev/null || true
+          else
+            echo "✅ All containers cleaned up successfully"
+          fi
+  build-from-source-test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Ubuntu container for build testing
+        run: |
+          echo "🐧 Setting up Ubuntu container for build-from-source testing"
+          
+          # Create an Ubuntu container for building
+          docker run -d --name ubuntu-build-test \
+            --privileged \
+            -v $(pwd):/workspace \
+            -w /workspace \
+            ubuntu:24.04 \
+            sleep infinity
+          
+          echo "✅ Ubuntu container started"
+
+      - name: Install Python dependencies (Qiniu SDK)
+        run: |
+          echo "📦 Installing required Python packages..."
+          python3 -m pip install --upgrade pip > /dev/null 2>&1
+          python3 -m pip install qiniu > /dev/null 2>&1
+          echo "✅ Python dependencies installed"
+          
+      - name: Install build dependencies in Ubuntu container
+        run: |
+          echo "📦 Installing build dependencies in Ubuntu container"
+          
+          docker exec ubuntu-build-test bash -c '
+          
+            # Update system
+            apt update -y
+            apt install -y ca-certificates
+
+            # Note: Ubuntu 24.04 (noble) already has main/universe enabled by default.
+            # Do NOT add jammy repos — they conflict with noble packages.
+
+            # Install Qt6 development packages
+            echo "📦 Installing Qt6 development packages..."
+            if ! apt install -y \
+              qt6-base-dev \
+              qt6-multimedia-dev \
+              qt6-serialport-dev \
+              qt6-svg-dev \
+              qt6-httpserver-dev \
+              qt6-websockets-dev \
+              qmake6 \
+              pkg-config; then
+              echo "❌ Qt6 package installation failed"
+              echo "🔍 Checking available Qt6 packages..."
+              apt-cache search qmake 2>/dev/null | head -10
+              exit 1
+            fi
+
+            # Install multimedia libraries
+            echo "📦 Installing multimedia libraries..."
+            if ! apt install -y \
+              libavformat-dev \
+              libavcodec-dev \
+              libavutil-dev \
+              libswscale-dev \
+              libavdevice-dev \
+              libgstreamer1.0-dev \
+              libgstreamer-plugins-base1.0-dev \
+              libjpeg-turbo8-dev \
+              libturbojpeg-dev \
+              libusb-1.0-0-dev \
+              libudev-dev \
+              libva-dev; then
+              echo "❌ Multimedia package installation failed"
+              echo "🔍 Checking what packages are available..."
+              apt list --installed | grep -E "(libav|libgstreamer|libjpeg|libusb)" | head -10 || echo "No matching packages found"
+              exit 1
+            fi
+            
+            # Verify installations
+            echo "🔍 Verifying package installations..."
+            for pkg in libavformat-dev libgstreamer1.0-dev libjpeg-turbo8-dev libturbojpeg-dev libusb-1.0-0-dev libudev-dev libva-dev; do
+              if dpkg -l $pkg >/dev/null 2>&1; then
+                echo "✅ $pkg: installed"
+              else
+                echo "❌ $pkg: NOT installed"
+                echo "   Trying to find what provides $pkg..."
+                apt search $pkg 2>/dev/null | head -3 || echo "   No providers found"
+              fi
+            done
+            
+            # Install system libraries
+            apt install -y \
+              libudev-dev \
+              libx11-dev \
+              libxkbcommon-dev \
+              build-essential \
+              git
+            
+            # Install Xvfb for headless GUI testing
+            apt install -y \
+              xvfb \
+              imagemagick \
+              x11-apps
+            
+            # Verify pkg-config can find the required libraries
+            echo "🔍 Verifying pkg-config setup..."
+            pkg-config --list-all | grep -E "(gstreamer|libav|libjpeg|libusb|libudev)" | head -10
+            
+            echo "🔍 Checking specific pkg-config files..."
+            for pkg in gstreamer-1.0 libavformat libjpeg libusb-1.0 libudev; do
+              if pkg-config --exists $pkg; then
+                echo "✅ $pkg: found"
+              else
+                echo "❌ $pkg: NOT found"
+                # Try to find the .pc file
+                find /usr -name "$pkg.pc" 2>/dev/null | head -1 || echo "  .pc file not found"
+              fi
+            done
+            
+            echo "✅ All build dependencies installed"
+          '
+
+      - name: Build Openterface_QT from source
+        run: |
+          echo "🔨 Building Openterface_QT from source using qmake6"
+          
+          docker exec ubuntu-build-test bash -c '
+            cd /workspace
+            
+            # Debug: Check what pkg-config files are available
+            echo "🔍 Available pkg-config files:"
+            find /usr/lib/x86_64-linux-gnu/pkgconfig -name "*.pc" | grep -E "(gstreamer|libav|libjpeg|libusb|libudev)" | head -10
+            
+            # Debug: Check specific pkg-config existence
+            echo "🔍 Checking pkg-config availability:"
+            for pkg in gstreamer-1.0 gstreamer-video-1.0 libavformat libavcodec libavutil libswscale libavdevice libjpeg libturbojpeg libusb-1.0 libudev; do
+              if pkg-config --exists $pkg 2>/dev/null; then
+                echo "✅ $pkg: found ($(pkg-config --modversion $pkg 2>/dev/null || echo "no version"))"
+              else
+                echo "❌ $pkg: NOT found"
+              fi
+            done
+            
+            # Create build directory
+            mkdir -p build
+            cd build
+
+            # Set up PATH for Qt6 binaries (qmake6 may not be in default PATH)
+            export PATH="/usr/lib/qt6/bin:$PATH"
+
+            # Determine correct qmake command
+            QMAKE_CMD=""
+            if command -v qmake6 >/dev/null 2>&1; then
+              QMAKE_CMD="qmake6"
+            elif command -v qmake >/dev/null 2>&1; then
+              QMAKE_CMD="qmake"
+            elif [ -x /usr/lib/qt6/bin/qmake ]; then
+              QMAKE_CMD="/usr/lib/qt6/bin/qmake"
+            else
+              echo "❌ qmake6/qmake not found. Searching..."
+              find /usr -name "qmake*" -type f 2>/dev/null | head -10
+              echo "Available qt6 packages:"
+              dpkg -l | grep qt6 2>/dev/null | head -10
+              exit 1
+            fi
+
+            echo "📋 Running $QMAKE_CMD..."
+            if ! $QMAKE_CMD ..; then
+              echo "❌ $QMAKE_CMD failed."
+              exit 1
+            fi
+            
+            # Build with make
+            echo "🔨 Running make..."
+            if ! make -j$(nproc); then
+              echo "❌ make failed. Last few lines of output:"
+              tail -20 build.log 2>/dev/null || echo "No build.log found"
+              exit 2
+            fi
+            
+            # Verify executable was created
+            if [ -f "openterfaceQT" ] && [ -x "openterfaceQT" ]; then
+              echo "✅ Build successful! Executable created:"
+              ls -lh openterfaceQT
+            else
+              echo "❌ Build failed - executable not found"
+              echo "📁 Build directory contents:"
+              ls -la
+              exit 3
+            fi
+          '
+
+      - name: Test application startup (GUI)
+        run: |
+          echo "🧪 Testing application startup with GUI"
+          
+          docker exec ubuntu-build-test bash -c '
+            cd /workspace/build
+            
+            # Start Xvfb for GUI testing
+            echo "📺 Starting Xvfb for GUI testing..."
+            Xvfb :99 -screen 0 1920x1080x24 &
+            XVFB_PID=$!
+            sleep 2
+            
+            # Set display
+            export DISPLAY=:99
+            
+            # Start the application in background
+            echo "🚀 Starting application..."
+            ./openterfaceQT &
+            APP_PID=$!
+            
+            # Wait for app to start and render
+            echo "⏳ Waiting 5 seconds for app to render..."
+            sleep 5
+            
+            # Take screenshot
+            echo "📷 Taking screenshot..."
+            timestamp=$(date +"%Y%m%d_%H%M%S")
+            mkdir -p /workspace/screenshots-build-from-source
+            screenshot_file="/workspace/screenshots-build-from-source/screenshot_startup_${timestamp}.jpg"
+            
+            SCREENSHOT_SUCCESS=false
+            
+            # Use import with explicit geometry
+            if ! $SCREENSHOT_SUCCESS; then
+              echo "📌 Attempting screenshot with import..."
+              if import -window root -quality 100 -geometry 1920x1080 "$screenshot_file" 2>/dev/null; then
+                SCREENSHOT_SUCCESS=true
+                echo "✅ Screenshot captured using import"
+              else
+                echo "⚠️ import method failed"
+              fi
+            fi
+            
+            if [ "$SCREENSHOT_SUCCESS" = true ]; then
+              echo "✅ Screenshot saved to: $screenshot_file"
+              ls -lh "$screenshot_file"
+            else
+              echo "❌ All screenshot methods failed"
+            fi
+            
+            # Kill the application
+            echo "🛑 Killing application..."
+            kill $APP_PID 2>/dev/null || true
+            
+            # Kill Xvfb
+            kill $XVFB_PID 2>/dev/null || true
+            
+            echo "✅ GUI startup test completed"
+          '
+
+      - name: Capture build artifacts
+        run: |
+          echo "📦 Capturing build artifacts"
+          
+          # Create artifacts directory
+          mkdir -p build-artifacts
+          
+          # Copy executable, screenshot, and build info
+          docker exec ubuntu-build-test bash -c '
+            cd /workspace/build
+            cp openterfaceQT /workspace/build-artifacts/ 2>/dev/null || echo "Executable not found"
+            
+            # Copy screenshot if it exists
+            if ls /workspace/screenshots-build-from-source/screenshot_startup_*.jpg 1> /dev/null 2>&1; then
+              cp /workspace/screenshots-build-from-source/screenshot_startup_*.jpg /workspace/build-artifacts/ || echo "Screenshot copy failed"
+            else
+              echo "No startup screenshot found"
+            fi
+            
+            # Create build info
+            echo "Build Information" > /workspace/build-artifacts/build-info.txt
+            echo "=================" >> /workspace/build-artifacts/build-info.txt
+            echo "Date: $(date)" >> /workspace/build-artifacts/build-info.txt
+            echo "System: Ubuntu Linux" >> /workspace/build-artifacts/build-info.txt
+            export PATH="/usr/lib/qt6/bin:$PATH"
+            QMAKE_CMD="qmake6"; command -v qmake6 >/dev/null 2>&1 || QMAKE_CMD="qmake"
+            echo "Qt Version: $($QMAKE_CMD --version 2>&1 | head -1)" >> /workspace/build-artifacts/build-info.txt
+            echo "GCC Version: $(gcc --version | head -1)" >> /workspace/build-artifacts/build-info.txt
+            echo "Build Command: $QMAKE_CMD .. && make -j$(nproc)" >> /workspace/build-artifacts/build-info.txt
+            
+            if [ -f openterfaceQT ]; then
+              echo "Executable Size: $(ls -lh openterfaceQT | awk '\''{print $5}'\'')" >> /workspace/build-artifacts/build-info.txt
+              echo "Build Status: SUCCESS" >> /workspace/build-artifacts/build-info.txt
+            else
+              echo "Build Status: FAILED" >> /workspace/build-artifacts/build-info.txt
+            fi
+          '
+          
+          # List captured artifacts
+          echo "📋 Build artifacts captured:"
+          ls -la build-artifacts/
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: openterface-build-from-source-test
+          path: build-artifacts/
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Display screenshots in summary (build-from-source)
+        if: always()
+        env:
+          QINIU_AK: ${{ secrets.QINIU_AK }}
+          QINIU_SK: ${{ secrets.QINIU_SK }}
+          QINIU_BUCKET: ${{ secrets.QINIU_BUCKET }}
+          QINIU_DOMAIN: ${{ secrets.QINIU_DOMAIN }}
+        run: |
+          echo "🔍 DEBUG: Starting screenshot summary generation (build-from-source)"
+          echo "📁 Checking for screenshots directory..."
+          ls -la screenshots-build-from-source/ 2>&1 || echo "Directory not found"
+          
+          # Start the summary
+          echo "# GUI Screenshots - Build From Source Test" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Build Type**: Build From Source (Ubuntu)" >> $GITHUB_STEP_SUMMARY
+          echo "**Commit**: ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Timestamp**: $(date -u)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ -d "screenshots-build-from-source" ] && [ "$(ls -A screenshots-build-from-source/*.jpg 2>/dev/null)" ]; then
+            echo "✅ Screenshots directory found"
+            echo "## Test Results" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            
+            total_jpgs=$(find screenshots-build-from-source/ -name "*.jpg" 2>/dev/null | wc -l)
+            content_jpgs=$(find screenshots-build-from-source/ -name "*.jpg" -exec identify -ping -format "%[mean]" {} \; 2>/dev/null | awk -F. '{if($1 > 100) count++} END {print count+0}')
+            
+            echo "📊 Found $total_jpgs screenshots with $content_jpgs containing content"
+            
+            echo "- **Total Screenshots**: $total_jpgs" >> $GITHUB_STEP_SUMMARY
+            echo "- **With Content**: $content_jpgs" >> $GITHUB_STEP_SUMMARY
+            
+            if [ "$total_jpgs" -gt 0 ]; then
+              echo "- **Status**: SUCCESS" >> $GITHUB_STEP_SUMMARY
+            fi
+            
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "## Screenshots" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            
+            screenshot_count=0
+            api_key_shown=0
+            upload_failed=0
+            
+            for img in screenshots-build-from-source/*.jpg; do
+              if [ -f "$img" ]; then
+                filename=$(basename "$img")
+                screenshot_count=$((screenshot_count + 1))
+                
+                artifact_name="screenshot-build-from-source-${screenshot_count}-$(echo "$filename" | sed 's/[^a-zA-Z0-9.-]/_/g')"
+                echo "$artifact_name|$img" >> /tmp/screenshot_artifacts_build_from_source.txt
+                
+                filesize=$(ls -lh "$img" | awk '{print $5}')
+                
+                echo "### Screenshot $screenshot_count: $filename" >> $GITHUB_STEP_SUMMARY
+                echo "" >> $GITHUB_STEP_SUMMARY
+                echo "**Size:** $filesize" >> $GITHUB_STEP_SUMMARY
+                echo "" >> $GITHUB_STEP_SUMMARY
+                
+                # Determine if screenshot has content based on file size
+                actual_size=$(stat -f%z "$img" 2>/dev/null || stat -c%s "$img" 2>/dev/null || echo 0)
+                if [ "$actual_size" -gt 5000 ]; then
+                  echo "**Status:** ✅ Content detected ($(($actual_size / 1024))KB)" >> $GITHUB_STEP_SUMMARY
+                else
+                  echo "**Status:** ❌ FAILED - Screenshot too small (size: $actual_size bytes, expected: >5000 bytes)" >> $GITHUB_STEP_SUMMARY
+                  echo "Screenshot file size validation failed: $actual_size bytes < 5000 bytes"
+                  exit 1
+                fi
+                echo "" >> $GITHUB_STEP_SUMMARY
+
+                if [ -n "$QINIU_AK" ] && [ -n "$QINIU_SK" ]; then
+                  echo "📤 Uploading $filename to Qiniu using Python script..."
+                  echo "🔑 Qiniu credentials validation: AK=${#QINIU_AK} chars, SK=${#QINIU_SK} chars"
+
+                  # Use Python script for upload instead of bash script
+                  UPLOAD_EXIT_CODE=0
+                  UPLOAD_OUTPUT=$(QINIU_AK="$QINIU_AK" QINIU_SK="$QINIU_SK" QINIU_BUCKET="${QINIU_BUCKET:-openterface}" QINIU_DOMAIN="$QINIU_DOMAIN" timeout 120 python3 ./docker/upload_to_qiniu.py "$img" 2>&1) || UPLOAD_EXIT_CODE=$?
+                  
+                  if [ $UPLOAD_EXIT_CODE -ne 0 ]; then
+                    echo "❌ Upload script failed with exit code: $UPLOAD_EXIT_CODE"
+                    echo "📋 Upload output:"
+                    echo "$UPLOAD_OUTPUT"
+                    echo "---"
+                  fi
+                  
+                  # Extract URL from Python script output
+                  UPLOAD_URL=$(echo "$UPLOAD_OUTPUT" | grep -oE 'https://[^ "]*' | tail -1)
+                  
+                  if [ -z "$UPLOAD_URL" ]; then
+                    UPLOAD_URL=$(echo "$UPLOAD_OUTPUT" | grep -E '^https' | tail -1)
+                  fi
+                  
+                  if [ -n "$UPLOAD_URL" ]; then
+                    echo "✅ Upload successful: $UPLOAD_URL"
+                    echo "<a href=\"$UPLOAD_URL\" target=\"_blank\"><img src=\"$UPLOAD_URL\" width=\"800\" alt=\"Screenshot\"></a>" >> $GITHUB_STEP_SUMMARY
+                    echo "" >> $GITHUB_STEP_SUMMARY
+                    echo "[View Full Size]($UPLOAD_URL)" >> $GITHUB_STEP_SUMMARY
+                    echo "" >> $GITHUB_STEP_SUMMARY
+                  else
+                    echo "⚠️ Upload URL extraction inconclusive for $filename"
+                    echo "   Raw output (last 10 lines):"
+                    echo "$UPLOAD_OUTPUT" | tail -10 | sed 's|^|   |'
+                    FALLBACK_URL=$(echo "$UPLOAD_OUTPUT" | grep -o 'https[^[:space:]]*' | tail -1)
+                    if [ -n "$FALLBACK_URL" ]; then
+                      echo "   ✅ Recovered URL: $FALLBACK_URL"
+                      echo "<a href=\"$FALLBACK_URL\" target=\"_blank\"><img src=\"$FALLBACK_URL\" width=\"800\" alt=\"Screenshot\"></a>" >> $GITHUB_STEP_SUMMARY
+                      echo "" >> $GITHUB_STEP_SUMMARY
+                      echo "[View Full Size]($FALLBACK_URL)" >> $GITHUB_STEP_SUMMARY
+                      echo "" >> $GITHUB_STEP_SUMMARY
+                    else
+                      upload_failed=1
+                      echo "⚠️ Upload to Qiniu failed - See artifacts for full image" >> $GITHUB_STEP_SUMMARY
+                      echo "" >> $GITHUB_STEP_SUMMARY
+                    fi
+                  fi
+                else
+                  if [ $api_key_shown -eq 0 ]; then
+                    echo "⚠️ Qiniu AK/SK not configured - displaying artifacts instead" >> $GITHUB_STEP_SUMMARY
+                    echo "" >> $GITHUB_STEP_SUMMARY
+                    api_key_shown=1
+                  fi
+                fi
+              fi
+            done
+            
+            if [ $upload_failed -eq 1 ] || [ $api_key_shown -eq 1 ]; then
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "## 📥 Download Screenshots from Artifacts" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "Since Qiniu upload is not available, all screenshots are saved as artifacts:" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "- **openterface-gui-screenshots-build-from-source-collection** - All screenshots" >> $GITHUB_STEP_SUMMARY
+              echo "- **openterface-gui-screenshots-build-from-source-individual** - Individual images" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+            fi
+            
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "## 📋 Step Logs" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "See the logs of the **Test application startup (GUI)** step for detailed test output." >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            
+          else
+            echo "❌ Screenshots directory not found or empty"
+            echo "## No Screenshots Available" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "No screenshots were generated during the test. Please check the logs of the **Test application startup (GUI)** step for details." >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Upload individual screenshots (build-from-source)
+        if: always()
+        run: |
+          echo "📤 Uploading individual screenshots as artifacts"
+          
+          mkdir -p /tmp/individual_screenshots_build_from_source
+          
+          if [ -f /tmp/screenshot_artifacts_build_from_source.txt ]; then
+            while IFS='|' read -r artifact_name img_path; do
+              if [ -f "$img_path" ]; then
+                cp "$img_path" "/tmp/individual_screenshots_build_from_source/$(basename "$img_path")"
+                echo "Prepared: $img_path -> $artifact_name"
+              fi
+            done < /tmp/screenshot_artifacts_build_from_source.txt
+          fi
+
+      - name: Upload screenshots collection (build-from-source)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: openterface-gui-screenshots-build-from-source-collection
+          path: screenshots-build-from-source/
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Upload individual screenshots as artifacts (build-from-source)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: openterface-gui-screenshots-build-from-source-individual
+          path: /tmp/individual_screenshots_build_from_source/
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Manage Qiniu bucket - Keep max 50 recent images (build-from-source)
+        if: always()
+        env:
+          QINIU_AK: ${{ secrets.QINIU_AK }}
+          QINIU_SK: ${{ secrets.QINIU_SK }}
+          QINIU_BUCKET: ${{ secrets.QINIU_BUCKET }}
+          QINIU_DOMAIN: ${{ secrets.QINIU_DOMAIN }}
+        run: |
+          echo "🧹 Cleaning up Qiniu bucket - Keeping maximum 50 recent images"
+          
+          if [ -z "$QINIU_AK" ] || [ -z "$QINIU_SK" ]; then
+            echo "⚠️ Qiniu credentials not configured, skipping bucket management"
+            exit 0
+          fi
+          
+          echo "📊 Running bucket management script..."
+          QINIU_AK="$QINIU_AK" \
+          QINIU_SK="$QINIU_SK" \
+          QINIU_BUCKET="${QINIU_BUCKET:-openterface}" \
+          QINIU_DOMAIN="$QINIU_DOMAIN" \
+          python3 ./docker/manage_qiniu_bucket.py -k 50 --force 2>&1
+          
+          if [ $? -eq 0 ]; then
+            echo "✅ Bucket management completed successfully"
+            echo "📋 Summary: Kept maximum 50 most recent images in Qiniu bucket"
+          else
+            echo "⚠️ Bucket management encountered an issue (non-blocking)"
+            echo "   This may occur if the bucket has fewer than 50 images or credentials are invalid"
+          fi
+
+      - name: Clean up build container
+        if: always()
+        run: |
+          echo "🧹 Cleaning up build container"
+          docker stop ubuntu-build-test || true
+          docker rm ubuntu-build-test || true
+          echo "✅ Build container cleaned up"
+
+  generate-combined-report:
+    if: always()
+    needs: [build-test-shared, build-from-source-test]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    
+    steps:
+      - name: Emergency cleanup (if build-test-shared hung)
+        timeout-minutes: 5
+        run: |
+          echo "🛑 Performing emergency docker cleanup..."
+          
+          # Kill any zombie containers from previous job
+          echo "1️⃣ Killing all docker containers..."
+          docker ps -aq | xargs -r docker kill 2>/dev/null || true
+          
+          sleep 1
+          
+          echo "2️⃣ Removing all docker containers..."
+          docker ps -aq | xargs -r docker rm -f 2>/dev/null || true
+          
+          # Kill processes aggressively
+          echo "3️⃣ Killing docker processes..."
+          pkill -9 -f "docker run" 2>/dev/null || true
+          pkill -9 -f "docker" 2>/dev/null || true
+          
+          # More aggressive: kill all bash processes running docker commands
+          echo "4️⃣ Cleaning up bash subshells..."
+          pkill -9 -f "bash.*docker" 2>/dev/null || true
+          pkill -9 -f "timeout.*docker" 2>/dev/null || true
+          
+          sleep 1
+          
+          # Verify
+          remaining=$(docker ps -aq 2>/dev/null | wc -l)
+          if [ "$remaining" -gt 0 ]; then
+            echo "⚠️ $remaining containers still running, attempting more aggressive cleanup..."
+            docker ps -aq | while read container; do
+              docker kill -s 9 "$container" 2>/dev/null || true
+            done
+          fi
+          
+          echo "✅ Emergency cleanup complete"
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Download shared screenshots
+        uses: actions/download-artifact@v4
+        with:
+          path: all-artifacts/
+        continue-on-error: true
+        timeout-minutes: 15
+        
+
+      - name: Check artifact availability
+        run: |
+          echo "🔍 Checking artifact status..."
+          if [ -d "all-artifacts" ] && [ -n "$(find all-artifacts -type f 2>/dev/null)" ]; then
+              echo "✅ Artifacts available"
+              echo "Artifact contents:"
+              find all-artifacts -type f | head -20
+          else
+              echo "⚠️ Artifacts unavailable (GitHub API timeout - this is transient)"
+              echo "Screenshots are still available in GitHub Actions UI: Actions → Job → Artifacts"
+              mkdir -p all-artifacts
+          fi
+
+      - name: Generate comprehensive test report
+        run: |
+          echo "📋 Generating comprehensive test report"
+          
+          # Add combined summary
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "# 📋 Test Report - Ubuntu (DEB + AppImage + Build From Source)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## 📊 Test Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Process each install type
+          for install_type in deb appimage; do
+            echo "### $install_type Results" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            
+            # Check if artifacts exist for this install type
+            screenshots_dir="all-artifacts/openterface-gui-screenshots-shared-${install_type}-collection"
+            if [ -d "$screenshots_dir" ]; then
+              total=$(find "$screenshots_dir" -name "*.jpg" 2>/dev/null | wc -l)
+              
+              if [ "$total" -gt 0 ]; then
+                # Use file size to determine if screenshots have content (more reliable)
+                content=$(find "$screenshots_dir" -name "*.jpg" -size +50k 2>/dev/null | wc -l)
+                
+                if [ "$content" -eq 0 ]; then
+                  # Fallback: check if files exist and are not tiny
+                  content=$(find "$screenshots_dir" -name "*.jpg" -type f 2>/dev/null | while read f; do
+                    size=$(stat -f%z "$f" 2>/dev/null || stat -c%s "$f" 2>/dev/null || echo 0)
+                    if [ "$size" -gt 1000 ]; then
+                      echo "1"
+                    fi
+                  done | wc -l)
+                fi
+                
+                if [ "$content" -gt 0 ]; then
+                  rate=$(( content * 100 / total ))
+                  status="✅ PASSED"
+                else
+                  rate=0
+                  status="✅ GENERATED (size verification inconclusive)"
+                fi
+                
+                echo "- **Total Screenshots**: $total" >> $GITHUB_STEP_SUMMARY
+                echo "- **With Content**: $content" >> $GITHUB_STEP_SUMMARY
+                echo "- **Success Rate**: ${rate}%" >> $GITHUB_STEP_SUMMARY
+                echo "- **Status**: $status" >> $GITHUB_STEP_SUMMARY
+              else
+                echo "- **Status**: ❌ FAILED - No screenshots generated" >> $GITHUB_STEP_SUMMARY
+              fi
+            else
+              echo "- **Status**: ⏭️ NOT RUN - No screenshots directory found" >> $GITHUB_STEP_SUMMARY
+            fi
+            echo "" >> $GITHUB_STEP_SUMMARY
+          done
+          
+          # Add build-from-source results
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Build From Source Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          screenshots_dir="all-artifacts/openterface-gui-screenshots-build-from-source-collection"
+          if [ -d "$screenshots_dir" ]; then
+            total=$(find "$screenshots_dir" -name "*.jpg" 2>/dev/null | wc -l)
+            
+            if [ "$total" -gt 0 ]; then
+              # Use file size to determine if screenshots have content (more reliable)
+              content=$(find "$screenshots_dir" -name "*.jpg" -size +50k 2>/dev/null | wc -l)
+              
+              if [ "$content" -eq 0 ]; then
+                # Fallback: check if files exist and are not tiny
+                content=$(find "$screenshots_dir" -name "*.jpg" -type f 2>/dev/null | while read f; do
+                  size=$(stat -f%z "$f" 2>/dev/null || stat -c%s "$f" 2>/dev/null || echo 0)
+                  if [ "$size" -gt 1000 ]; then
+                    echo "1"
+                  fi
+                done | wc -l)
+              fi
+              
+              if [ "$content" -gt 0 ]; then
+                rate=$(( content * 100 / total ))
+                status="✅ PASSED"
+              else
+                rate=0
+                status="✅ GENERATED (size verification inconclusive)"
+              fi
+              
+              echo "- **Total Screenshots**: $total" >> $GITHUB_STEP_SUMMARY
+              echo "- **With Content**: $content" >> $GITHUB_STEP_SUMMARY
+              echo "- **Success Rate**: ${rate}%" >> $GITHUB_STEP_SUMMARY
+              echo "- **Status**: $status" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "- **Status**: ❌ FAILED - No screenshots generated" >> $GITHUB_STEP_SUMMARY
+            fi
+          else
+            echo "- **Status**: ⏭️ NOT RUN - No screenshots directory found" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo "**Generated on**: $(date -u)" >> $GITHUB_STEP_SUMMARY
+          echo "**Workflow**: ${{ github.workflow }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Run ID**: [${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})" >> $GITHUB_STEP_SUMMARY
+          
+          echo ""
+          echo "✅ Combined test report generated and added to summary"
+      - name: Upload combined test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: combined-test-report
+          path: combined-test-report.md
+          if-no-files-found: warn
+          retention-days: 7

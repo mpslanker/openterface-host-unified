@@ -1,0 +1,699 @@
+#include "DeviceSelectorDialog.h"
+#include "../../device/DeviceManager.h"
+#include "../../device/platform/AbstractPlatformDeviceManager.h"
+#ifdef _WIN32
+#include "../../device/platform/WindowsDeviceManager.h"
+#endif
+#include "../../serial/SerialPortManager.h"
+#include "../../host/cameramanager.h"
+#include "../../video/videohid.h"  // For HID device status tracking
+#include "edid/edididentity.h"
+#include "edid/edididentitycache.h"
+#include "../globalsetting.h"
+#include <QLoggingCategory>
+#include <QHeaderView>
+#include <QSplitter>
+#include <QCheckBox>
+#include <QPainter>
+#include <QMessageBox>
+#include "log/opflogging.h"
+
+OPF_LOGGING_CATEGORY(log_device_selector, "opf.ui.deviceselector")
+
+DeviceSelectorDialog::DeviceSelectorDialog(CameraManager *cameraManager, VideoHid *videoHid, QWidget *parent)
+    : QDialog(parent)
+    , m_serialPortManager(&SerialPortManager::getInstance())
+    , m_cameraManager(cameraManager)
+    , m_videoHid(videoHid)  // For HID device status tracking in device selector UI
+    , m_autoRefreshTimer(new QTimer(this))
+    , m_autoRefreshEnabled(false)
+    , m_totalHotplugEvents(0)
+{
+    setWindowTitle(tr("Openterface Device Selector"));
+    setMinimumSize(800, 600);
+    setupUI();
+    
+    // Connect to DeviceManager singleton
+    DeviceManager& deviceManager = DeviceManager::getInstance();
+    connect(&deviceManager, &DeviceManager::devicesChanged,
+            this, &DeviceSelectorDialog::refreshDeviceList);
+    connect(&deviceManager, &DeviceManager::deviceAdded,
+            this, [this](const DeviceInfo&) { refreshDeviceList(); });
+    connect(&deviceManager, &DeviceManager::deviceRemoved,
+            this, [this](const DeviceInfo&) { refreshDeviceList(); });
+    
+    // Setup auto-refresh timer
+    m_autoRefreshTimer->setSingleShot(false);
+    m_autoRefreshTimer->setInterval(3000); // 3 seconds
+    connect(m_autoRefreshTimer, &QTimer::timeout, this, &DeviceSelectorDialog::autoRefreshDevices);
+    
+    qCDebug(log_device_selector) << "Device Selector Dialog created";
+}
+
+DeviceSelectorDialog::~DeviceSelectorDialog()
+{
+    if (m_autoRefreshTimer->isActive()) {
+        m_autoRefreshTimer->stop();
+    }
+}
+
+void DeviceSelectorDialog::setupUI()
+{
+    m_mainLayout = new QVBoxLayout(this);
+    
+    // Create main splitter
+    QSplitter* mainSplitter = new QSplitter(Qt::Horizontal, this);
+    
+    // Device list group
+    m_deviceListGroup = new QGroupBox(tr("Available Openterface Devices"), this);
+    QVBoxLayout* listLayout = new QVBoxLayout(m_deviceListGroup);
+    
+    m_deviceList = new QListWidget(this);
+    m_deviceList->setSelectionMode(QAbstractItemView::SingleSelection);
+    connect(m_deviceList, &QListWidget::itemSelectionChanged, 
+            this, &DeviceSelectorDialog::onDeviceSelectionChanged);
+    listLayout->addWidget(m_deviceList);
+    
+    // List control buttons
+    QHBoxLayout* listButtonLayout = new QHBoxLayout();
+    m_refreshButton = new QPushButton(tr("Refresh"), this);
+    m_autoRefreshButton = new QPushButton(tr("Auto Refresh"), this);
+    m_autoRefreshButton->setCheckable(true);
+    QPushButton* testHotplugButton = new QPushButton(tr("Test Hotplug"), this);
+    QPushButton* clearCacheButton = new QPushButton(tr("Clear Cache"), this);
+    QPushButton* debugUSBButton = new QPushButton(tr("Debug USB"), this);
+    
+    connect(m_refreshButton, &QPushButton::clicked, this, &DeviceSelectorDialog::onRefreshClicked);
+    connect(m_autoRefreshButton, &QPushButton::toggled, this, &DeviceSelectorDialog::onAutoRefreshToggled);
+    connect(testHotplugButton, &QPushButton::clicked, this, [this]() {
+        qCDebug(log_device_selector) << "Manual hotplug test triggered";
+        // Use DeviceManager singleton instead of SerialPortManager
+        DeviceManager& deviceManager = DeviceManager::getInstance();
+        deviceManager.checkForChanges();
+    });
+    connect(clearCacheButton, &QPushButton::clicked, this, [this]() {
+        qCDebug(log_device_selector) << "Clearing device cache";
+        DeviceManager& deviceManager = DeviceManager::getInstance();
+        if (deviceManager.getPlatformManager()) {
+            deviceManager.getPlatformManager()->clearCache();
+            qCDebug(log_device_selector) << "Cache cleared, refreshing device list";
+        } else {
+            qCWarning(log_device_selector) << "No platform manager available";
+        }
+        refreshDeviceList();
+    });
+    connect(debugUSBButton, &QPushButton::clicked, this, [this]() {
+        qCDebug(log_device_selector) << "Debug USB devices triggered";
+        DeviceManager& deviceManager = DeviceManager::getInstance();
+        if (deviceManager.getPlatformManager()) {
+#ifdef _WIN32
+            auto* platformManager = deviceManager.getPlatformManager();
+            // Cast to Windows manager and call debug method
+            auto* windowsManager = dynamic_cast<WindowsDeviceManager*>(platformManager);
+            if (windowsManager) {
+                windowsManager->debugListAllUSBDevices();
+            } else {
+                qCWarning(log_device_selector) << "Platform manager is not WindowsDeviceManager";
+            }
+#endif
+        } else {
+            qCWarning(log_device_selector) << "No device manager available for USB debug";
+        }
+    });
+    
+    listButtonLayout->addWidget(m_refreshButton);
+    listButtonLayout->addWidget(m_autoRefreshButton);
+    listButtonLayout->addWidget(testHotplugButton);
+    listButtonLayout->addWidget(clearCacheButton);
+    listButtonLayout->addWidget(debugUSBButton);
+    listButtonLayout->addStretch();
+    listLayout->addLayout(listButtonLayout);
+    
+    mainSplitter->addWidget(m_deviceListGroup);
+    
+    // Right panel for details and status
+    QWidget* rightPanel = new QWidget(this);
+    QVBoxLayout* rightLayout = new QVBoxLayout(rightPanel);
+    
+    // Device details group
+    m_deviceDetailsGroup = new QGroupBox(tr("Device Details"), this);
+    QVBoxLayout* detailsLayout = new QVBoxLayout(m_deviceDetailsGroup);
+    
+    m_deviceDetails = new QTextEdit(this);
+    m_deviceDetails->setReadOnly(true);
+    m_deviceDetails->setMaximumHeight(300);
+    detailsLayout->addWidget(m_deviceDetails);
+    
+    rightLayout->addWidget(m_deviceDetailsGroup);
+    
+    // Status group
+    m_statusGroup = new QGroupBox(tr("Status"), this);
+    QVBoxLayout* statusLayout = new QVBoxLayout(m_statusGroup);
+    
+    m_statusLabel = new QLabel(tr("No devices detected"), this);
+    m_statusLabel->setWordWrap(true);
+    statusLayout->addWidget(m_statusLabel);
+    
+    m_hotplugStatsLabel = new QLabel(tr("Hotplug events: 0"), this);
+    statusLayout->addWidget(m_hotplugStatsLabel);
+    
+    rightLayout->addWidget(m_statusGroup);
+    rightLayout->addStretch();
+    
+    mainSplitter->addWidget(rightPanel);
+    mainSplitter->setSizes({400, 400});
+    
+    m_mainLayout->addWidget(mainSplitter);
+    
+    // Dialog buttons
+    m_buttonLayout = new QHBoxLayout();
+    m_selectButton = new QPushButton(tr("Select Device"), this);
+    m_selectButton->setEnabled(false);
+    m_switchButton = new QPushButton(tr("Switch to Device"), this);
+    m_switchButton->setEnabled(false);
+    m_deactivateButton = new QPushButton(tr("Deactivate Current"), this);
+    m_showInterfacesButton = new QPushButton(tr("Show Active Interfaces"), this);
+    m_closeButton = new QPushButton(tr("Close"), this);
+    
+    connect(m_selectButton, &QPushButton::clicked, this, &DeviceSelectorDialog::onSelectDevice);
+    connect(m_switchButton, &QPushButton::clicked, this, &DeviceSelectorDialog::onSwitchToDevice);
+    connect(m_deactivateButton, &QPushButton::clicked, this, &DeviceSelectorDialog::onDeactivateDevice);
+    connect(m_showInterfacesButton, &QPushButton::clicked, this, &DeviceSelectorDialog::onShowActiveInterfaces);
+    connect(m_closeButton, &QPushButton::clicked, this, &QDialog::close);
+    
+    m_buttonLayout->addStretch();
+    m_buttonLayout->addWidget(m_selectButton);
+    m_buttonLayout->addWidget(m_switchButton);
+    m_buttonLayout->addWidget(m_deactivateButton);
+    m_buttonLayout->addWidget(m_showInterfacesButton);
+    m_buttonLayout->addWidget(m_closeButton);
+    
+    m_mainLayout->addLayout(m_buttonLayout);
+}
+
+void DeviceSelectorDialog::refreshDeviceList()
+{
+    qCDebug(log_device_selector) << "Refreshing device list";
+    
+    DeviceManager& deviceManager = DeviceManager::getInstance();
+    m_currentDevices = deviceManager.discoverDevices();
+    populateDeviceList();
+    updateStatusInfo();
+}
+
+void DeviceSelectorDialog::populateDeviceList()
+{
+    m_deviceList->clear();
+    
+    qCDebug(log_device_selector) << "Populating list with" << m_currentDevices.size() << "devices";
+    
+    // One entry per unit (shared rule with the device menu and MCP device_list)
+    m_currentDevices = selectableDevices(m_currentDevices);
+
+    for (const auto& device : m_currentDevices) {
+        QString itemText = formatCompleteDeviceListItem(device);
+        QListWidgetItem* item = new QListWidgetItem(itemText, m_deviceList);
+        item->setData(Qt::UserRole, device.getUniqueKey());
+        
+        // Add device status icons
+        QIcon deviceIcon = createDeviceStatusIcon(device);
+        item->setIcon(deviceIcon);
+        
+        // Highlight if this is the currently selected device
+        DeviceManager& deviceManager = DeviceManager::getInstance();
+        DeviceInfo currentDevice = deviceManager.getCurrentSelectedDevice();
+        if (currentDevice.isValid() && device.getUniqueKey() == currentDevice.getUniqueKey()) {
+            item->setBackground(QColor(200, 255, 200)); // Light green
+            item->setText(itemText + tr(" [CURRENT]"));
+        }
+    }
+    
+    // Update device details if we have a selection
+    if (m_deviceList->count() > 0 && m_deviceList->currentRow() == -1) {
+        m_deviceList->setCurrentRow(0);
+    }
+}
+
+QString DeviceSelectorDialog::formatDeviceListItem(const DeviceInfo& device)
+{
+    return formatCompleteDeviceListItem(device);
+}
+
+QString DeviceSelectorDialog::formatCompleteDeviceListItem(const DeviceInfo& device)
+{
+    QStringList parts;
+    // EDID display name first when the unit has been identified
+    const QString edidName = edid::EdidIdentityCache::instance().displayName(device.portChain);
+    if (!edidName.isEmpty()) {
+        parts << edidName << "-";
+    }
+    // Make port chain more prominent at the start with cleaner format
+    parts << QString(tr("Port %1")).arg(device.portChain);
+    parts << tr("- Openterface Mini KVM");
+    
+    // Show all available interfaces
+    QStringList interfaces;
+    if (device.hasSerialPort()) {
+        QString portName = device.serialPortPath;
+        if (portName.startsWith("COM")) {
+            interfaces << QString(tr("Serial(%1)")).arg(portName);
+        } else {
+            interfaces << QString(tr("Serial(%1)")).arg(portName);
+        }
+    }
+    if (device.hasHidDevice()) interfaces << tr("HID");
+    if (device.hasCameraDevice()) interfaces << tr("Camera");
+    if (device.hasAudioDevice()) interfaces << tr("Audio");
+    
+    if (!interfaces.isEmpty()) {
+        parts << QString("[%1]").arg(interfaces.join(" | "));
+    }
+    
+    // Add device status
+    QString status = getDeviceStatusText(device);
+    if (!status.isEmpty()) {
+        parts << QString("- %1").arg(status);
+    }
+    
+    return parts.join(" ");
+}
+
+QIcon DeviceSelectorDialog::createDeviceStatusIcon(const DeviceInfo& device)
+{
+    // Create a composite icon showing device status
+    QPixmap pixmap(32, 32);
+    pixmap.fill(Qt::transparent);
+    QPainter painter(&pixmap);
+    
+    // Base device icon
+    painter.fillRect(2, 2, 28, 28, QColor(100, 150, 255, 100));
+    painter.setPen(QPen(QColor(50, 100, 200), 2));
+    painter.drawRect(2, 2, 28, 28);
+    
+    // Add status indicators for each sub-device
+    int xPos = 4;
+    if (device.hasSerialPort()) {
+        painter.fillRect(xPos, 26, 4, 4, Qt::green);
+        xPos += 6;
+    }
+    if (device.hasHidDevice()) {
+        painter.fillRect(xPos, 26, 4, 4, Qt::blue);
+        xPos += 6;
+    }
+    if (device.hasCameraDevice()) {
+        painter.fillRect(xPos, 26, 4, 4, Qt::magenta);
+        xPos += 6;
+    }
+    if (device.hasAudioDevice()) {
+        painter.fillRect(xPos, 26, 4, 4, Qt::yellow);
+        xPos += 6;
+    }
+    
+    return QIcon(pixmap);
+}
+
+QString DeviceSelectorDialog::getDeviceStatusText(const DeviceInfo& device)
+{
+    QStringList statusParts;
+    
+    int subDeviceCount = device.getInterfaceCount();
+    statusParts << QString(tr("%1/4 interfaces")).arg(subDeviceCount);
+    
+    // Check if device is currently in use
+    DeviceManager& deviceManager = DeviceManager::getInstance();
+    DeviceInfo currentDevice = deviceManager.getCurrentSelectedDevice();
+    if (currentDevice.isValid() && device.getUniqueKey() == currentDevice.getUniqueKey()) {
+        statusParts << tr("ACTIVE");
+    } else {
+        statusParts << tr("Available");
+    }
+    
+    return statusParts.join(" | ");
+}
+
+QString DeviceSelectorDialog::formatDeviceDetails(const DeviceInfo& device)
+{
+    if (!device.isValid()) {
+        return tr("No device selected");
+    }
+    
+    QStringList details;
+    details << QString(tr("<h3>Openterface Mini KVM Device</h3>"));
+    details << QString(tr("<h4>USB Port: %1</h4>")).arg(device.portChain);
+    details << QString(tr("<b>Device Instance ID:</b> %1")).arg(device.deviceInstanceId);
+    details << QString(tr("<b>Last Seen:</b> %1")).arg(device.lastSeen.toString("yyyy-MM-dd hh:mm:ss"));
+    details << "";
+    
+    // Physical device overview
+    details << tr("<h4>Physical Device Overview:</h4>");
+    int availableInterfaces = device.getInterfaceCount();
+    details << QString(tr("<b>Available Interfaces:</b> %1/4")).arg(availableInterfaces);
+    details << QString(tr("<b>Device Status:</b> %1")).arg(getDeviceStatusText(device));
+    details << QString(tr("<b>Physical Location:</b> USB Port %1")).arg(device.portChain);
+    details << "";
+    
+    // Interface details
+    details << tr("<h4>Interface Details:</h4>");
+    
+    if (device.hasSerialPort()) {
+        details << QString(tr("<b>Serial Interface:</b> %1")).arg(device.serialPortPath);
+        details << QString(tr("   Device ID: %1")).arg(device.serialPortId);
+        details << tr("   Function: Control and communication");
+    } else {
+        details << tr("\u274c <b>Serial Interface:</b> Not available");
+    }
+    
+    if (device.hasHidDevice()) {
+        // Check if this is the currently active HID device
+        QString currentHIDPath;
+        QString currentHIDPortChain;
+        if (m_videoHid) {
+            currentHIDPath = m_videoHid->getCurrentHIDDevicePath();
+            currentHIDPortChain = m_videoHid->getCurrentHIDPortChain();
+        }
+
+        bool isActiveHID = (!currentHIDPortChain.isEmpty() && currentHIDPortChain == device.portChain) ||
+                          (!currentHIDPath.isEmpty() && currentHIDPath == device.hidDevicePath);
+
+        QString activeStatus = isActiveHID ? tr(" (Active)") : "";
+        details << QString(tr("\U0001f5b1\ufe0f <b>HID Interface:</b> Available%1")).arg(activeStatus);
+        details << QString(tr("   Device Path: %1")).arg(device.hidDevicePath);
+        details << QString(tr("   Device ID: %1")).arg(device.hidDeviceId);
+        details << tr("   Function: Keyboard/mouse control");
+    } else {
+        details << tr("\u274c <b>HID Interface:</b> Not available");
+    }
+    
+    if (device.hasCameraDevice()) {
+        // Check if this is the currently active camera device
+        QString currentCameraId;
+        if (m_cameraManager) {
+            currentCameraId = m_cameraManager->getCurrentCameraDeviceId();
+        }
+        
+        bool isActiveCamera = (!currentCameraId.isEmpty() && 
+                              (currentCameraId == device.cameraDeviceId || 
+                               currentCameraId.contains(device.cameraDeviceId)));
+        
+        QString activeStatus = isActiveCamera ? tr(" (Active)") : "";
+        details << QString(tr("\U0001f4f9 <b>Camera Interface:</b> Available%1")).arg(activeStatus);
+        details << QString(tr("   Device Path: %1")).arg(device.cameraDevicePath);
+        details << QString(tr("   Device ID: %1")).arg(device.cameraDeviceId);
+        details << tr("   Function: Video capture");
+    } else {
+        details << tr("\u274c <b>Camera Interface:</b> Not available");
+    }
+    
+    if (device.hasAudioDevice()) {
+        details << tr("\U0001f50a <b>Audio Interface:</b> Available");
+        details << QString(tr("   Device ID: %1")).arg(device.audioDeviceId);
+        details << tr("   Function: Audio capture/playback");
+    } else {
+        details << tr("\u274c <b>Audio Interface:</b> Not available");
+    }
+    
+    details << "";
+    
+    // Usage instructions
+    details << tr("<h4>Usage Instructions:</h4>");
+    details << tr("• Select this device to use all available interfaces");
+    details << tr("• The device will be activated for serial communication");
+    details << tr("• HID interface will be available for keyboard/mouse control");
+    details << tr("• Camera and audio interfaces will be available for capture");
+    
+    return details.join("<br>");
+}
+
+void DeviceSelectorDialog::updateDeviceDetails(const DeviceInfo& device)
+{
+    QString detailsHtml = formatDeviceDetails(device);
+    m_deviceDetails->setHtml(detailsHtml);
+}
+
+void DeviceSelectorDialog::updateStatusInfo()
+{
+    QString status;
+    if (m_currentDevices.isEmpty()) {
+        status = tr("No Openterface devices detected");
+    } else {
+        // Since m_currentDevices now contains deduplicated devices, we can use its size directly
+        status = QString(tr("Found %1 physical Openterface device(s)"))
+                    .arg(m_currentDevices.size());
+        
+        // Use DeviceManager to get current selected device instead of SerialPortManager
+        DeviceManager& deviceManager = DeviceManager::getInstance();
+        DeviceInfo current = deviceManager.getCurrentSelectedDevice();
+        if (current.isValid()) {
+            status += QString(tr("<br>Currently active: USB Port %1")).arg(current.portChain);
+            status += QString(tr("<br>Active interfaces: %1")).arg(current.getInterfaceSummary());
+        } else {
+            status += tr("<br>No device currently active");
+        }
+    }
+    
+    m_statusLabel->setText(status);
+    
+    // Update hotplug stats
+    QString statsText = QString(tr("Hotplug events: %1")).arg(m_totalHotplugEvents);
+    if (m_lastEventTime.isValid()) {
+        statsText += QString(tr("<br>Last event: %1")).arg(m_lastEventTime.toString("hh:mm:ss"));
+    }
+    m_hotplugStatsLabel->setText(statsText);
+}
+
+void DeviceSelectorDialog::onDeviceSelectionChanged()
+{
+    QListWidgetItem* currentItem = m_deviceList->currentItem();
+    if (!currentItem) {
+        m_selectButton->setEnabled(false);
+        m_switchButton->setEnabled(false);
+        updateDeviceDetails(DeviceInfo());
+        return;
+    }
+    
+    QString deviceKey = currentItem->data(Qt::UserRole).toString();
+    
+    // Find the device with this key
+    DeviceInfo selectedDevice;
+    for (const auto& device : m_currentDevices) {
+        if (device.getUniqueKey() == deviceKey) {
+            selectedDevice = device;
+            break;
+        }
+    }
+    
+    m_selectedDevice = selectedDevice;
+    bool deviceValid = selectedDevice.isValid();
+    bool isCurrentDevice = false;
+    
+    if (deviceValid) {
+        DeviceManager& deviceManager = DeviceManager::getInstance();
+        DeviceInfo currentDevice = deviceManager.getCurrentSelectedDevice();
+        isCurrentDevice = (currentDevice.isValid() && 
+                          currentDevice.getUniqueKey() == selectedDevice.getUniqueKey());
+    }
+    
+    m_selectButton->setEnabled(deviceValid && !isCurrentDevice);
+    m_switchButton->setEnabled(deviceValid && !isCurrentDevice);
+    updateDeviceDetails(selectedDevice);
+}
+
+void DeviceSelectorDialog::onSelectDevice()
+{
+    if (!m_selectedDevice.isValid() || !m_serialPortManager) {
+        qCWarning(log_device_selector) << "Cannot select device - invalid device or no serial port manager";
+        return;
+    }
+    
+    qCInfo(log_device_selector) << "Selecting complete physical device:" << m_selectedDevice.portChain;
+    
+    // Show device selection confirmation
+    QMessageBox::StandardButton reply = QMessageBox::question(this, 
+        tr("Select Physical Device"), 
+        QString(tr("Select Openterface device at port %1?\n\n"
+                "This will activate:\n"
+                "\u2022 Serial communication: %2\n"
+                "\u2022 HID interface: %3\n"
+                "\u2022 Camera interface: %4\n"
+                "\u2022 Audio interface: %5"))
+        .arg(m_selectedDevice.portChain)
+        .arg(m_selectedDevice.hasSerialPort() ? m_selectedDevice.serialPortPath : tr("Not available"))
+        .arg(m_selectedDevice.hasHidDevice() ? tr("Available") : tr("Not available"))
+        .arg(m_selectedDevice.hasCameraDevice() ? tr("Available") : tr("Not available"))
+        .arg(m_selectedDevice.hasAudioDevice() ? tr("Available") : tr("Not available")),
+        QMessageBox::Yes | QMessageBox::No);
+    
+    if (reply != QMessageBox::Yes) {
+        return;
+    }
+}
+
+void DeviceSelectorDialog::onSwitchToDevice()
+{
+    if (!m_selectedDevice.isValid()) {
+        qCWarning(log_device_selector) << "Cannot switch device - invalid device";
+        return;
+    }
+    
+    DeviceManager& deviceManager = DeviceManager::getInstance();
+    DeviceInfo currentDevice = deviceManager.getCurrentSelectedDevice();
+    if (!currentDevice.isValid()) {
+        // No current device, just select the new one
+        onSelectDevice();
+        return;
+    }
+    
+    qCInfo(log_device_selector) << "Switching physical device from" << currentDevice.portChain 
+                               << "to" << m_selectedDevice.portChain;
+    
+    // Show device switching confirmation
+    QMessageBox::StandardButton reply = QMessageBox::question(this, 
+        tr("Switch Physical Device"), 
+        QString(tr("Switch from device at USB Port %1 to USB Port %2?\n\n"
+                "Current device interfaces will be deactivated and\n"
+                "new device interfaces will be activated."))
+        .arg(currentDevice.portChain)
+        .arg(m_selectedDevice.portChain),
+        QMessageBox::Yes | QMessageBox::No);
+    
+    if (reply != QMessageBox::Yes) {
+        return;
+    }
+    
+    // Use the centralized device switching function
+    // Note: Audio switching not included in this dialog - only camera, HID, and serial switching
+    auto result = deviceManager.switchToDeviceByPortChainWithCamera(m_selectedDevice.portChain, m_cameraManager);
+    
+    // Show result to user
+    QMessageBox::information(this, tr("Device Switch Result"), result.statusMessage);
+    
+    // Refresh the device list to show updated status
+    refreshDeviceList();
+}
+
+void DeviceSelectorDialog::onDeactivateDevice()
+{
+    DeviceManager& deviceManager = DeviceManager::getInstance();
+    DeviceInfo currentDevice = deviceManager.getCurrentSelectedDevice();
+    if (!currentDevice.isValid()) {
+        QMessageBox::information(this, tr("No Active Device"), tr("No device is currently active."));
+        return;
+    }
+    
+    // Show deactivation confirmation
+    QMessageBox::StandardButton reply = QMessageBox::question(this, 
+        tr("Deactivate Device"), 
+        QString(tr("Deactivate current device at port %1?\n\n"
+                "All device interfaces will be released."))
+        .arg(currentDevice.portChain),
+        QMessageBox::Yes | QMessageBox::No);
+    
+    if (reply != QMessageBox::Yes) {
+        return;
+    }
+    
+    // m_serialPortManager->deactivateCurrentDevice();
+    
+    QMessageBox::information(this, tr("Device Deactivated"),
+                           QString(tr("Device at port %1 has been deactivated."))
+                           .arg(currentDevice.portChain));
+    
+    populateDeviceList(); // Refresh to show current selection
+    updateStatusInfo();
+}
+
+void DeviceSelectorDialog::onShowActiveInterfaces()
+{
+    showActiveInterfaces();
+}
+
+void DeviceSelectorDialog::showDeviceSelectionSuccess()
+{
+    QMessageBox msgBox(this);
+    msgBox.setWindowTitle(tr("Device Selected Successfully"));
+    msgBox.setIcon(QMessageBox::Information);
+    
+    QString message = QString(tr("Openterface device at port %1 is now active!\n\n")).arg(m_selectedDevice.portChain);
+    
+    QStringList activeInterfaces;
+    if (m_selectedDevice.hasSerialPort()) activeInterfaces << QString(tr("✓ Serial: %1")).arg(m_selectedDevice.serialPortPath);
+    if (m_selectedDevice.hasHidDevice()) activeInterfaces << tr("✓ HID: Available for keyboard/mouse");
+    if (m_selectedDevice.hasCameraDevice()) activeInterfaces << tr("✓ Camera: Available for video capture");
+    if (m_selectedDevice.hasAudioDevice()) activeInterfaces << tr("✓ Audio: Available for audio capture");
+    
+    if (!activeInterfaces.isEmpty()) {
+        message += tr("Active interfaces:\n") + activeInterfaces.join("\n");
+    }
+    
+    msgBox.setText(message);
+    msgBox.exec();
+}
+
+void DeviceSelectorDialog::showActiveInterfaces()
+{
+    DeviceManager& deviceManager = DeviceManager::getInstance();
+    DeviceInfo currentDevice = deviceManager.getCurrentSelectedDevice();
+    if (!currentDevice.isValid()) {
+        QMessageBox::information(this, tr("Active Interfaces"), tr("No device is currently selected."));
+        return;
+    }
+    
+    // Show device interface information directly from DeviceInfo
+    QString interfaceInfo = QString(tr("Active Device: %1\n\nInterfaces:\n%2"))
+                           .arg(currentDevice.getDeviceDisplayName())
+                           .arg(currentDevice.getInterfaceSummary());
+    
+    QMessageBox::information(this, tr("Active Interfaces"), interfaceInfo);
+}
+
+void DeviceSelectorDialog::onRefreshClicked()
+{
+    refreshDeviceList();
+}
+
+void DeviceSelectorDialog::onAutoRefreshToggled(bool enabled)
+{
+    m_autoRefreshEnabled = enabled;
+    
+    if (enabled) {
+        m_autoRefreshTimer->start();
+        m_autoRefreshButton->setText(tr("Auto Refresh ON"));
+        qCDebug(log_device_selector) << "Auto refresh enabled";
+    } else {
+        m_autoRefreshTimer->stop();
+        m_autoRefreshButton->setText(tr("Auto Refresh OFF"));
+        qCDebug(log_device_selector) << "Auto refresh disabled";
+    }
+}
+
+void DeviceSelectorDialog::autoRefreshDevices()
+{
+    if (m_autoRefreshEnabled) {
+        refreshDeviceList();
+    }
+}
+
+void DeviceSelectorDialog::onHotplugEvent(const DeviceChangeEvent& event)
+{
+    m_totalHotplugEvents++;
+    m_lastEventTime = event.timestamp;
+    
+    qCInfo(log_device_selector) << "Hotplug event received in DeviceSelectorDialog:" 
+                                << "Added:" << event.addedDevices.size()
+                                << "Removed:" << event.removedDevices.size()
+                                << "Modified:" << event.modifiedDevices.size();
+    
+    // Log device details
+    for (const auto& device : event.addedDevices) {
+        qCDebug(log_device_selector) << "  + Added device:" << device.portChain << device.deviceInstanceId;
+    }
+    for (const auto& device : event.removedDevices) {
+        qCDebug(log_device_selector) << "  - Removed device:" << device.portChain << device.deviceInstanceId;
+    }
+    for (const auto& pair : event.modifiedDevices) {
+        qCDebug(log_device_selector) << "  * Modified device:" << pair.second.portChain << pair.second.deviceInstanceId;
+    }
+    
+    // Auto-refresh the list when devices change
+    refreshDeviceList();
+}

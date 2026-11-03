@@ -1,0 +1,134 @@
+#include "DeviceInfo.h"
+#include <QStringList>
+
+DeviceInfo::DeviceInfo(const QString& portChain)
+    : portChain(portChain)
+    , hasCompanionDevice(false)
+    , lastSeen(QDateTime::currentDateTime())
+{
+}
+
+QVariantMap DeviceInfo::toMap() const
+{
+    QVariantMap map;
+    map["portChain"] = portChain;
+    map["deviceInstanceId"] = deviceInstanceId;
+    map["vid"] = vid;
+    map["pid"] = pid;
+    map["hidVid"] = hidVid;
+    map["hidPid"] = hidPid;
+    map["companionPortChain"] = companionPortChain;
+    map["hasCompanionDevice"] = hasCompanionDevice;
+    map["serialPortPath"] = serialPortPath;
+    map["hidDevicePath"] = hidDevicePath;
+    map["cameraDevicePath"] = cameraDevicePath;
+    map["audioDevicePath"] = audioDevicePath;
+    map["serialPortId"] = serialPortId;
+    map["hidDeviceId"] = hidDeviceId;
+    map["cameraDeviceId"] = cameraDeviceId;
+    map["audioDeviceId"] = audioDeviceId;
+    map["platformSpecific"] = platformSpecific;
+    map["lastSeen"] = lastSeen;
+    return map;
+}
+
+void DeviceInfo::fromMap(const QVariantMap& map)
+{
+    portChain = map.value("portChain").toString();
+    deviceInstanceId = map.value("deviceInstanceId").toString();
+    vid = map.value("vid").toString();
+    pid = map.value("pid").toString();
+    hidVid = map.value("hidVid").toString();
+    hidPid = map.value("hidPid").toString();
+    companionPortChain = map.value("companionPortChain").toString();
+    hasCompanionDevice = map.value("hasCompanionDevice", false).toBool();
+    serialPortPath = map.value("serialPortPath").toString();
+    hidDevicePath = map.value("hidDevicePath").toString();
+    cameraDevicePath = map.value("cameraDevicePath").toString();
+    audioDevicePath = map.value("audioDevicePath").toString();
+    serialPortId = map.value("serialPortId").toString();
+    hidDeviceId = map.value("hidDeviceId").toString();
+    cameraDeviceId = map.value("cameraDeviceId").toString();
+    audioDeviceId = map.value("audioDeviceId").toString();
+    platformSpecific = map.value("platformSpecific").toMap();
+    lastSeen = map.value("lastSeen").toDateTime();
+}
+
+QString DeviceInfo::getUniqueKey() const
+{
+    if (!portChain.isEmpty()) {
+        return portChain;
+    }
+    if (!deviceInstanceId.isEmpty()) {
+        return deviceInstanceId;
+    }
+    return serialPortPath + "|" + hidDevicePath;
+}
+
+bool DeviceInfo::isValid() const
+{
+    return !portChain.isEmpty() || !deviceInstanceId.isEmpty() || 
+           !serialPortPath.isEmpty() || !hidDevicePath.isEmpty();
+}
+
+bool DeviceInfo::operator==(const DeviceInfo& other) const
+{
+    return portChain == other.portChain &&
+           deviceInstanceId == other.deviceInstanceId &&
+           vid == other.vid &&
+           pid == other.pid &&
+           hidVid == other.hidVid &&
+           hidPid == other.hidPid &&
+           companionPortChain == other.companionPortChain &&
+           hasCompanionDevice == other.hasCompanionDevice &&
+           serialPortPath == other.serialPortPath &&
+           serialPortId == other.serialPortId &&
+           hidDevicePath == other.hidDevicePath &&
+           hidDeviceId == other.hidDeviceId &&
+           cameraDevicePath == other.cameraDevicePath &&
+           cameraDeviceId == other.cameraDeviceId &&
+           audioDevicePath == other.audioDevicePath &&
+           audioDeviceId == other.audioDeviceId &&
+           platformSpecific == other.platformSpecific;
+}
+
+bool DeviceInfo::operator!=(const DeviceInfo& other) const
+{
+    return !(*this == other);
+}
+
+QString DeviceInfo::displayPortChain(const QString &portChain)
+{
+    QString filtered;
+    for (QChar c : portChain) {
+        if (c.isDigit() && c != QChar('0')) {
+            filtered.append(c);
+        }
+    }
+    QStringList parts;
+    for (QChar c : filtered) {
+        parts << QString(c);
+    }
+    return parts.join('-');
+}
+
+QList<DeviceInfo> selectableDevices(const QList<DeviceInfo> &devices)
+{
+    QSet<QString> companionPortChains;
+    for (const DeviceInfo &d : devices) {
+        if (!d.companionPortChain.isEmpty()) {
+            companionPortChains.insert(d.companionPortChain);
+        }
+    }
+    QMap<QString, DeviceInfo> byPortChain;   // QMap: stable, sorted by port chain
+    for (const DeviceInfo &d : devices) {
+        if (d.portChain.isEmpty() || companionPortChains.contains(d.portChain)) {
+            continue;
+        }
+        auto it = byPortChain.find(d.portChain);
+        if (it == byPortChain.end() || d.getInterfaceCount() > it->getInterfaceCount()) {
+            byPortChain[d.portChain] = d;
+        }
+    }
+    return byPortChain.values();
+}

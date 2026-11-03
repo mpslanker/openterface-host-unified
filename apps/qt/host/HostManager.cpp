@@ -1,0 +1,307 @@
+/*
+* ========================================================================== *
+*                                                                            *
+*    This file is part of the Openterface Mini KVM App QT version            *
+*                                                                            *
+*    Copyright (C) 2024   <info@openterface.com>                             *
+*                                                                            *
+*    This program is free software: you can redistribute it and/or modify    *
+*    it under the terms of the GNU General Public License as published by    *
+*    the Free Software Foundation version 3.                                 *
+*                                                                            *
+*    This program is distributed in the hope that it will be useful, but     *
+*    WITHOUT ANY WARRANTY; without even the implied warranty of              *
+*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU        *
+*    General Public License for more details.                                *
+*                                                                            *
+*    You should have received a copy of the GNU General Public License       *
+*    along with this program. If not, see <http://www.gnu.org/licenses/>.    *
+*                                                                            *
+* ========================================================================== *
+*/
+
+#include "HostManager.h"
+#include "../serial/SerialPortManager.h"
+#include <QProcess>
+#include <QCoreApplication>
+#include <QtConcurrent/QtConcurrent>
+#include <QTimer>
+#include <QRandomGenerator>
+#include "log/opflogging.h"
+
+OPF_LOGGING_CATEGORY(log_core_host, "opf.core.host")
+
+HostManager::HostManager(QObject *parent) : QObject(parent),
+                                            mouseManager(),
+                                            keyboardManager()
+{
+}
+
+void HostManager::setEventCallback(StatusEventCallback* callback)
+{
+    qCDebug(log_core_host) << "HostManager.setEventCallback";
+    SerialPortManager::getInstance().setEventCallback(callback);
+    mouseManager.setEventCallback(callback);
+    statusEventCallback = callback;
+}
+
+void HostManager::handleKeyPress(QKeyEvent *event)
+{
+    // forward nativeVirtualKey so KeyboardManager can detect left/right modifiers on Windows
+    handleKeyboardAction(event->key(), event->modifiers(), true, event->nativeVirtualKey());
+}
+
+void HostManager::handleKeyRelease(QKeyEvent *event)
+{
+    handleKeyboardAction(event->key(), event->modifiers(), false, event->nativeVirtualKey());
+}
+
+void HostManager::handleMousePress(MouseEventDTO *event)
+{
+    if(event->isAbsoluteMode()) {
+        mouseManager.handleAbsoluteMouseAction(event->getX(), event->getY(), event->getMouseButton(), 0);
+    } else {
+        mouseManager.handleRelativeMouseAction(event->getX(), event->getY(), event->getMouseButton(), 0);
+    }
+}
+
+void HostManager::handleMouseRelease(MouseEventDTO *event)
+{
+    if(event->isAbsoluteMode()) {
+        mouseManager.handleAbsoluteMouseAction(event->getX(), event->getY(), 0, 0);
+    } else {
+        mouseManager.handleRelativeMouseAction(event->getX(), event->getY(), 0, 0);
+    }
+}
+
+void HostManager::handleMouseScroll(MouseEventDTO *event)
+{
+    if(event->isAbsoluteMode()) {
+        mouseManager.handleAbsoluteMouseAction(event->getX(), event->getY(), 0, event->getWheelDelta());
+    } else {
+        mouseManager.handleRelativeMouseAction(event->getX(), event->getY(), 0, event->getWheelDelta());
+    }
+}
+
+void HostManager::handleMouseMove(MouseEventDTO *event)
+{
+    if(event->isAbsoluteMode()) {
+        mouseManager.handleAbsoluteMouseAction(event->getX(), event->getY(), event->getMouseButton(), 0);
+    } else {
+        mouseManager.handleRelativeMouseAction(event->getX(), event->getY(), event->getMouseButton(), 0);
+    }
+}
+
+void HostManager::resetSerialPort()
+{
+    if(SerialPortManager::getInstance().restartPort()) {
+        qCDebug(log_core_host) << "Serial port restarted successfully";
+    } else {
+        qCDebug(log_core_host) << "Serial port restart failed";
+    }
+}
+
+void HostManager::restartApplication() {
+    // Save the application's path
+    // QString appPath = QCoreApplication::applicationFilePath();
+
+    // // Start a new instance of the application
+    // QStringList arguments = QCoreApplication::arguments();
+    // arguments.removeFirst(); // Remove the application's path from the arguments
+    // QProcess::startDetached(appPath, arguments);
+
+    // // Quit the current instance
+    // QCoreApplication::quit();
+
+}
+
+void HostManager::pasteTextToTarget(QString text){
+    qCDebug(log_core_host) << "Paste text to target: " << text;
+    keyboardManager.pasteTextToTarget(text);
+}
+
+void HostManager::startAutoMoveMouse()
+{
+    mouseManager.startAutoMoveMouse();
+}
+
+void HostManager::stopAutoMoveMouse()
+{
+    mouseManager.stopAutoMoveMouse();
+}
+
+void HostManager::sendCtrlAltDel()
+{
+    qCDebug(log_core_host) << "Sending Ctrl+Alt+Del to target";
+    keyboardManager.sendCtrlAltDel();
+}
+
+void HostManager::handleFunctionKey(int keyCode, int modifiers)
+{
+    handleKeyboardAction(keyCode, modifiers, true);
+    QTimer::singleShot(50, this, [this, keyCode, modifiers]() {
+        handleKeyboardAction(keyCode, modifiers, false);
+    });
+}
+
+void HostManager::handleKeySequence(const QList<KeyStep>& steps)
+{
+    if (steps.isEmpty()) return;
+
+    // Check for special combo
+    for (const KeyStep& step : steps) {
+        if (static_cast<unsigned>(step.modifiers) == static_cast<unsigned>(Qt::ControlModifier | Qt::AltModifier) && step.keyCode == Qt::Key_Delete) {
+            sendCtrlAltDel();
+            return;
+        }
+    }
+
+    int totalDelay = 0;
+    for (int i = 0; i < steps.size(); ++i) {
+        const KeyStep& step = steps[i];
+        int delay = totalDelay;
+        QTimer::singleShot(delay, this, [this, step]() {
+            handleKeyboardAction(step.keyCode, step.modifiers, true);
+        });
+        totalDelay += 50;
+        QTimer::singleShot(totalDelay, this, [this, step]() {
+            handleKeyboardAction(step.keyCode, step.modifiers, false);
+        });
+        totalDelay += 30;
+    }
+}
+
+void HostManager::handleKeyCombo(const QList<int>& keyCodes)
+{
+    if (keyCodes.isEmpty()) return;
+
+    // Check for special combo: Ctrl+Alt+Delete
+    bool hasCtrl = false, hasAlt = false, hasDel = false;
+    for (int kc : keyCodes) {
+        if (kc == Qt::Key_Control) hasCtrl = true;
+        if (kc == Qt::Key_Alt) hasAlt = true;
+        if (kc == Qt::Key_Delete) hasDel = true;
+    }
+    if (hasCtrl && hasAlt && hasDel) {
+        sendCtrlAltDel();
+        return;
+    }
+
+    // Separate modifiers and regular keys
+    QList<int> modifiers;
+    QList<int> regularKeys;
+    int modifierFlags = 0;
+    for (int kc : keyCodes) {
+        if (CustomKeyManager::isModifierKey(kc)) {
+            modifiers << kc;
+            if (kc == Qt::Key_Control) modifierFlags |= Qt::ControlModifier;
+            else if (kc == Qt::Key_Shift) modifierFlags |= Qt::ShiftModifier;
+            else if (kc == Qt::Key_Alt) modifierFlags |= Qt::AltModifier;
+            else if (kc == Qt::Key_Meta) modifierFlags |= Qt::MetaModifier;
+        } else {
+            regularKeys << kc;
+        }
+    }
+
+    // Press modifiers first
+    for (int mod : modifiers) {
+        handleKeyboardAction(mod, modifierFlags, true);
+    }
+    // Press regular keys
+    for (int kc : regularKeys) {
+        handleKeyboardAction(kc, modifierFlags, true);
+    }
+    // Short delay then release
+    QTimer::singleShot(50, this, [this, regularKeys, modifiers, modifierFlags]() {
+        // Release regular keys
+        for (int kc : regularKeys) {
+            handleKeyboardAction(kc, modifierFlags, false);
+        }
+        // Release modifiers (in reverse order)
+        for (int i = modifiers.size() - 1; i >= 0; --i) {
+            handleKeyboardAction(modifiers[i], modifierFlags, false);
+        }
+    });
+}
+
+void HostManager::handleKeyboardAction(int keyCode, int modifiers, bool isKeyDown, unsigned int nativeVirtualKey)
+{
+    QString hexKeyCode = QString::number(keyCode, 16);
+    int effectiveModifiers = keyboardManager.isModiferKeys(keyCode) ? modifiers : modifiers;
+    qCDebug(log_core_host) << (isKeyDown ? "Key press" : "Key release") << "event for qt key code:" << keyCode << "(" << hexKeyCode << "), modifiers:" << "0x" + QString::number(effectiveModifiers, 16) << " nativeVK:" << QString::number(nativeVirtualKey, 16);
+    
+    // forward nativeVirtualKey to KeyboardManager
+    keyboardManager.handleKeyboardAction(keyCode, effectiveModifiers, isKeyDown, nativeVirtualKey);
+    
+    if (isKeyDown) {
+        qCDebug(log_core_host) << "Key press event detected with keyCode:" << keyCode << " and modifiers:" << effectiveModifiers;
+        m_lastKeyCode = keyCode;
+        m_lastModifiers = effectiveModifiers;
+
+        // Update the status with the last key pressed
+        if (statusEventCallback != nullptr) {
+            QString keyText;
+            // Handle modifier keys specially
+            if (keyboardManager.isModiferKeys(keyCode)) {
+                // For modifier keys, just use the key name without combining with modifiers
+                keyText = QKeySequence(effectiveModifiers).toString();
+            } else {
+                keyText = QKeySequence(keyCode | effectiveModifiers).toString();
+            }
+            qCDebug(log_core_host) << "onLastKeyPressed:" << keyText;
+            statusEventCallback->onLastKeyPressed(keyText);
+        }
+    } else {
+        // When key is released, clear the status
+        if (statusEventCallback != nullptr) {
+            statusEventCallback->onLastKeyPressed("");
+        }
+    }
+}
+
+void HostManager::releaseAllKeys()
+{
+    qCInfo(log_core_host) << "releaseAllKeys() called - clearing all keyboard state";
+    keyboardManager.releaseAllKeys();
+}
+
+void HostManager::setRepeatingKeystroke(int interval) {
+    m_repeatingInterval = interval;
+    if (interval > 0) {
+        if (!m_repeatingTimer) {
+            m_repeatingTimer = new QTimer(this);
+            connect(m_repeatingTimer, &QTimer::timeout, this, &HostManager::repeatLastKeystroke);
+        }
+        qCDebug(log_core_host) << "Repeating keystroke start with interval:" << interval << "ms";
+        m_repeatingTimer->start(interval);
+    } else {
+        if (m_repeatingTimer) {
+            qCDebug(log_core_host) << "Repeating keystroke stopped";
+            m_repeatingTimer->stop();
+        }
+        // Send a key release event for the last pressed key
+        if (m_lastKeyCode != 0) {
+            qCDebug(log_core_host) << "Sending key release for last pressed key:" << m_lastKeyCode;
+            handleKeyboardAction(m_lastKeyCode, m_lastModifiers, false);
+        }
+        // Clear the last key code and modifier when stopping repetition
+        m_lastKeyCode = 0;
+        m_lastModifiers = 0;
+        qCDebug(log_core_host) << "Last key code and modifier cleared";
+    }
+}
+
+void HostManager::repeatLastKeystroke() {
+    if (m_repeatingInterval > 0 && m_lastKeyCode != 0) {
+        qCDebug(log_core_host) << "Repeating keystroke, keyCode:" << m_lastKeyCode;
+        handleKeyboardAction(m_lastKeyCode, m_lastModifiers, true);
+        QTimer::singleShot(50, this, [this]() {
+            handleKeyboardAction(m_lastKeyCode, m_lastModifiers, false);
+        });
+    }
+}
+
+void HostManager::setKeyboardLayout(const QString& layoutName) {
+    qCDebug(log_core_host) << "Keyboard layout changed to" << layoutName;
+    keyboardManager.setKeyboardLayout(layoutName);
+}

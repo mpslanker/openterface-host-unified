@@ -1,0 +1,19 @@
+<!DOCTYPE RCC>
+<RCC version="1.0">
+    <qresource prefix="/config/keyboards">
+        <file>qwerty_us.json</file>
+        <file>qwerty_uk.json</file>
+        <file>azerty_fr.json</file>
+        <file>azerty_be.json</file>
+        <file>qwertz_de.json</file>
+        <file>qwerty_dk.json</file>
+        <file>qwerty_se.json</file>
+        <file>japanese.json</file>
+        <file>qwerty_es.json</file>
+        <file>qwerty_it.json</file>
+        <file>qwerty_no.json</file>
+        <file>qwerty_fi.json</file>
+        <file>qwertz_ch.json</file>
+        <file>azerty_ch_fr.json</file>
+    </qresource>
+</RCC> 

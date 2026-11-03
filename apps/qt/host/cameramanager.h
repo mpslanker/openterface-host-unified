@@ -1,0 +1,244 @@
+#ifndef CAMERAMANAGER_H
+#define CAMERAMANAGER_H
+
+#include <QObject>
+#include <QCameraDevice>  // Keep for device enumeration only
+#include <QGraphicsVideoItem>
+#include <QDir>
+#include <QStandardPaths>
+#include <QRect>
+#include <QList>
+#include <QSize>
+#include <QVideoFrameFormat>
+#include "host/multimediabackend.h"
+#include "../device/DeviceInfo.h"
+#include <QLoggingCategory>
+#include <QDateTime>
+
+// Forward declarations
+class GStreamerBackendHandler;
+class FFmpegBackendHandler;
+class QtBackendHandler;
+class VideoPane;
+
+// Struct to represent a video format key, used for comparing and sorting video formats
+// It includes resolution, frame rate range, and pixel format
+struct VideoFormatKey {
+    QSize resolution;
+    int minFrameRate;
+    int maxFrameRate;
+    QVideoFrameFormat::PixelFormat pixelFormat;
+
+    bool operator<(const VideoFormatKey &other) const {
+        if (resolution.width() != other.resolution.width())
+            return resolution.width() < other.resolution.width();
+        if (resolution.height() != other.resolution.height())
+            return resolution.height() < other.resolution.height();
+        if (minFrameRate != other.minFrameRate)
+            return minFrameRate < other.minFrameRate;
+        if (maxFrameRate != other.maxFrameRate)
+            return maxFrameRate < other.maxFrameRate;
+        return pixelFormat < other.pixelFormat;
+    }
+};
+
+
+class CameraManager : public QObject
+{
+    Q_OBJECT
+
+public:
+    explicit CameraManager(QObject *parent = nullptr);
+    ~CameraManager();
+
+    // Camera control - FFmpeg backend only
+    void startCamera();
+    void stopCamera();
+    
+    // Image capture - uses FFmpeg backend
+    void takeImage(const QString& file);
+    void takeAreaImage(const QString& file, const QRect& captureArea);
+    
+    // Recording - uses FFmpeg backend
+    void startRecording();
+    void stopRecording();
+    void pauseRecording();
+    void resumeRecording();
+    bool isRecording() const;
+    bool isPaused() const;
+    
+    // Backend handler access
+    FFmpegBackendHandler* getFFmpegBackend() const;
+    GStreamerBackendHandler* getGStreamerBackend() const;
+    MultimediaBackendHandler* getBackendHandler() const;
+
+    // Returns the latest camera frame at native (unscaled) resolution.
+    QImage getLatestOriginalFrame();
+    
+    // Video output management
+    void setVideoOutput(QGraphicsVideoItem* videoOutput);
+    
+    // Platform detection
+    static bool isWindowsPlatform();
+
+    // Camera initialization with video output
+    bool initializeCameraWithVideoOutput(QGraphicsVideoItem* videoOutput);
+    bool initializeCameraWithVideoOutput(VideoPane* videoPane, bool startCapture = true);
+    
+    // Check if there's an active camera device
+    bool hasActiveCameraDevice() const;
+
+    // Check if the camera is actively streaming (receiving frames within last 5 seconds)
+    bool isCameraStreaming() const;
+
+    // Called by VideoPane when a new frame is received (updates frame timestamp)
+    void onNewVideoFrameReceived();
+    
+    // Auto-switch to new device when hotplug event occurs (only if no active device)
+    bool tryAutoSwitchToNewDevice(const QString& portChain);
+    
+    // Get the port chain of the currently active camera device (if any)
+    QString getCurrentCameraPortChain() const;
+    
+    // Deactivate camera if it matches the specified port chain
+    bool deactivateCameraByPortChain(const QString& portChain);
+    
+    // Helper methods to detect current multimedia backend
+    bool isGStreamerBackend() const;
+    bool isFFmpegBackend() const;
+#ifdef Q_OS_WIN
+    bool isQtBackend() const;
+    bool isMediaFoundationBackend() const;
+#endif
+    
+    // Camera device management and switching
+    QList<QCameraDevice> getAvailableCameraDevices() const;
+    QCameraDevice getCurrentCameraDevice() const;
+    bool switchToCameraDevice(const QCameraDevice &cameraDevice, const QString& portChain);
+    bool switchToCameraDeviceByPortChain(const QString &portChain);
+    bool isCameraDeviceValid(const QCameraDevice& device) const;
+    QString getCurrentCameraDeviceId() const;
+    QString getCurrentCameraDeviceDescription() const;
+    
+    // Manual device refresh for Qt 6 compatibility
+    void refreshAvailableCameraDevices();
+    
+    // Video output refresh and hotplug support
+    void refreshVideoOutput();
+    
+signals:
+    void cameraActiveChanged(bool active);
+    void recordingStarted();
+    void recordingStopped();
+    void recordingError(const QString &errorString);
+    void cameraError(const QString &errorString);
+    void frameTimeout();  // Emitted when no frames received after camera activation
+    void resolutionsUpdated(int input_width, int input_height, float input_fps, int capture_width, int capture_height, int capture_fps, float pixelClk);
+    void imageCaptured(int id, const QImage& img);
+    void lastImagePath(const QString& imagePath);
+    void cameraDeviceChanged(const QString& newDeviceId, const QString& oldDeviceId);
+    void cameraDeviceSwitched(const QString& fromDeviceId, const QString& toDeviceId);
+    void cameraDeviceConnected(const QString& deviceId, const QString& portChain);
+    void cameraDeviceDisconnected(const QString& deviceId, const QString& portChain);
+    void cameraDeviceSwitching(const QString& fromDevice, const QString& toDevice);
+    void cameraDeviceSwitchComplete(const QString& device);
+    void availableCameraDevicesChanged(int deviceCount);
+    void newDeviceAutoConnected(const QCameraDevice& device, const QString& portChain);
+    void fpsChanged(double fps);
+    
+public slots:
+    // Note: Automatic device coordination slots have been removed
+    // Camera devices are now managed manually through the UI only
+    
+private slots:
+    void onImageCaptured(int id, const QImage& img);
+    void onFFmpegCaptureError(const QString& error);
+    void onMediaFoundationError(const QString& error);
+
+private:
+    // Backend handler management
+    void initializeBackendHandler();
+    void updateBackendHandler();
+    
+    // Helper method to convert Qt camera device to platform-specific device path
+    QString convertCameraDeviceToPath(const QCameraDevice& device) const;
+
+    // Declaration for findMatchingCameraDevice
+    QCameraDevice findMatchingCameraDevice(const QString& portChain) const;
+    QCameraDevice findCameraByDeviceInfo(const DeviceInfo& deviceInfo) const;
+    
+    // Helper method for device ID matching
+    QString extractShortIdentifier(const QString& fullId) const;
+
+    // Helper method to find the first Qt camera device that looks like an Openterface device
+    QCameraDevice findQtOpenterfaceDevice(const QList<QCameraDevice>& devices) const;
+
+    // Helper to determine device path for direct capture (FFmpeg/GStreamer).
+    // Returns an empty string on failure. On success, outPortChain will be set
+    // to the port chain if available and ok will be set to true.
+    QString determineDirectCaptureDevicePath(QString &outPortChain, bool &ok) const;
+    
+    // FFmpeg backend specific methods
+    void handleFFmpegDeviceDisconnection(const QString& devicePath);
+    
+    // Hotplug monitoring integration
+    void connectToHotplugMonitor();
+    void disconnectFromHotplugMonitor();
+    void setupWindowsHotplugMonitoring();
+
+    // Retry mechanism for auto-switch
+    void startAutoSwitchRetry(const QString& devicePath);
+    void cancelAutoSwitchRetry();
+    void executeAutoSwitchRetry();
+    
+    // Member variables - FFmpeg backend only
+    std::unique_ptr<MultimediaBackendHandler> m_backendHandler;
+    QGraphicsVideoItem* m_graphicsVideoOutput;
+    int m_video_width;
+    int m_video_height;
+    QString filePath;
+
+    QRect copyRect;
+    
+    // Camera device management member variables
+    QCameraDevice m_currentCameraDevice;
+    QString m_currentCameraDeviceId;
+    QString m_currentCameraPortChain;  // Track the port chain of current camera device
+    QString m_lastActiveCameraPortChain;  // HOTPLUG FIX (修复十一): Saved port chain before deactivation
+    qint64 m_lastFrameTimestamp = 0;   // Timestamp (ms since epoch) of last received frame
+    QList<QCameraDevice> m_availableCameraDevices;
+    QTimer* m_frameTimeoutTimer = nullptr;  // Detects when no frames are received
+    bool m_frameTimeoutWarningShown = false;  // Only warn once per session
+    int m_hotplugCameraRestartRetries = 0;    // Retry counter for camera restart after hotplug
+    static constexpr int MAX_HOTPLUG_CAMERA_RESTART_RETRIES = 3;
+    QTimer* m_hotplugDebounceTimer = nullptr;  // Coalesces rapid hotplug events
+
+    // Recording management
+    QString m_currentRecordingPath;  // Path to the current recording file
+
+    // Auto-switch retry state
+    struct AutoSwitchRetryState {
+        int retryCount = 0;
+        int maxRetries = 5;
+        QString targetDevicePath;
+        QTimer* retryTimer = nullptr;
+        bool isActive = false;
+
+        int getNextInterval() const {
+            switch (retryCount) {
+                case 0: return 500;
+                case 1: return 1000;
+                case 2: return 2000;
+                case 3: return 3000;
+                default: return 5000;
+            }
+        }
+    } m_autoSwitchRetry;
+
+private slots:
+    void onVideoInputsChanged();
+};
+
+Q_DECLARE_LOGGING_CATEGORY(log_ui_camera)
+
+#endif // CAMERAMANAGER_H

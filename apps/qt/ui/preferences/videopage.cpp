@@ -1,0 +1,914 @@
+/*
+* ========================================================================== *
+*                                                                            *
+*    This file is part of the Openterface Mini KVM App QT version            *
+*                                                                            *
+*    Copyright (C) 2024   <info@openterface.com>                             *
+*                                                                            *
+*    This program is free software: you can redistribute it and/or modify    *
+*    it under the terms of the GNU General Public License as published by    *
+*    the Free Software Foundation version 3.                                 *
+*                                                                            *
+*    This program is distributed in the hope that it will be useful, but     *
+*    WITHOUT ANY WARRANTY; without even the implied warranty of              *
+*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU        *
+*    General Public License for more details.                                *
+*                                                                            *
+*    You should have received a copy of the GNU General Public License       *
+*    along with this program. If not, see <http://www.gnu.org/licenses/>.    *
+*                                                                            *
+* ========================================================================== *
+*/
+
+#include "videopage.h"
+#include "fontstyle.h"
+#include "ui/globalsetting.h"
+#include "host/cameramanager.h"
+#include "host/multimediabackend.h"
+#include "host/backend/ffmpegbackendhandler.h"
+#include "ui/statusbar/statuswidget.h"
+#include <QDebug>
+#include <QComboBox>
+#include <QHBoxLayout>
+#include <QVBoxLayout>
+#include <QLabel>
+#include <QVariant>
+#include <QMediaFormat>
+#include <QLineEdit>
+#include <QCheckBox>
+#include <QPushButton>
+#include <QDialog>
+#include <QFrame>
+#include <QMediaDevices>
+#include <QWidget>
+#include <QThread>
+#include <QApplication>
+#include <QEventLoop>
+#include <QTimer>
+
+VideoPage::VideoPage(CameraManager *cameraManager, QWidget *parent) : PreferencePageBase(parent)
+    , m_cameraManager(cameraManager)
+{
+    setupUI();
+}
+
+void VideoPage::setupUI()
+{
+    // UI setup implementation
+    QLabel *videoLabel = new QLabel(
+        "<span style=' font-weight: bold;'>Video setting</span>");
+    videoLabel->setStyleSheet(bigLabelFontSize);
+    videoLabel->setTextFormat(Qt::RichText);
+
+    // Input Resolution Setting Section
+    QCheckBox *overrideSettingsCheckBox = new QCheckBox("Override HDMI Input Setting");
+    overrideSettingsCheckBox->setObjectName("overrideSettingsCheckBox");
+
+    QLabel *inputResolutionLabel = new QLabel("Input Resolution: ");
+    inputResolutionLabel->setStyleSheet(bigLabelFontSize);
+    QLabel *customResolutionLabel = new QLabel("Resolution: ");
+
+    // Create a QWidget to hold the custom resolution layout
+    QWidget *customInputResolutionWidget = new QWidget();
+    QHBoxLayout *customResolutionLayout = new QHBoxLayout(customInputResolutionWidget); // Set layout to the widget
+
+    QLineEdit *customInputWidthEdit = new QLineEdit();
+    customInputWidthEdit->setPlaceholderText("Enter width");
+    customInputWidthEdit->setObjectName("customInputWidthEdit");
+
+    QLineEdit *customInputHeightEdit = new QLineEdit();
+    customInputHeightEdit->setPlaceholderText("Enter height");
+    customInputHeightEdit->setObjectName("customInputHeightEdit");
+
+    customResolutionLayout->addWidget(customResolutionLabel);
+    customResolutionLayout->addWidget(customInputWidthEdit);
+    QLabel *xLabel = new QLabel("x");
+    customResolutionLayout->addWidget(xLabel);
+    customResolutionLayout->addWidget(customInputHeightEdit);
+
+    // Add the Input Resolution section to the layout
+    QVBoxLayout *videoLayout = new QVBoxLayout(this);
+    videoLayout->addWidget(videoLabel);
+
+    videoLayout->addWidget(overrideSettingsCheckBox);
+    videoLayout->addWidget(customInputResolutionWidget);
+
+    // Add a horizontal line separator
+    QFrame *separatorLine = new QFrame();
+    separatorLine->setFrameShape(QFrame::HLine);
+    separatorLine->setFrameShadow(QFrame::Sunken);
+    videoLayout->addWidget(separatorLine);
+
+    // Capture Resolution Setting Section
+    videoLabel->setText(QString("<span style=' font-weight: bold;'>%1</span>").arg(tr("General video setting")));
+    videoLabel->setStyleSheet(bigLabelFontSize);
+    videoLabel->setTextFormat(Qt::RichText);
+
+    QLabel *resolutionsLabel = new QLabel(tr("Capture resolutions: "));
+    resolutionsLabel->setStyleSheet(smallLabelFontSize);
+
+    videoFormatBox = new QComboBox();
+    videoFormatBox->setObjectName("videoFormatBox");
+
+    QLabel *framerateLabel = new QLabel(tr("Framerate: "));
+    framerateLabel->setStyleSheet(smallLabelFontSize);
+
+    fpsComboBox = new QComboBox();
+    fpsComboBox->setObjectName("fpsComboBox");
+
+    QHBoxLayout *hBoxLayout = new QHBoxLayout();
+    hBoxLayout->addWidget(fpsComboBox);
+
+    QLabel *formatLabel = new QLabel(tr("Pixel format: "));
+    formatLabel->setStyleSheet(smallLabelFontSize);
+    pixelFormatBox = new QComboBox();
+    pixelFormatBox->setObjectName("pixelFormatBox");
+
+    QLabel *hintLabel = new QLabel(tr("Note: On linx the video may go black after OK or Apply. Please unplug and re-plug the host cable."));
+    hintLabel->setWordWrap(true);
+
+    // Add another separator
+    QFrame *separatorLine2 = new QFrame();
+    separatorLine2->setFrameShape(QFrame::HLine);
+    separatorLine2->setFrameShadow(QFrame::Sunken);
+
+    // Media Backend Setting Section
+    QLabel *backendLabel = new QLabel(tr("Media Backend: "));
+    backendLabel->setStyleSheet(smallLabelFontSize);
+
+    QComboBox *mediaBackendBox = new QComboBox();
+    mediaBackendBox->setObjectName("mediaBackendBox");
+
+    // Platform-specific backend options
+#ifdef Q_OS_WIN
+    // Windows: FFmpeg (DirectShow), Media Foundation
+    mediaBackendBox->addItem("FFmpeg (DirectShow)", "ffmpeg");
+    mediaBackendBox->addItem("Media Foundation", "mediafoundation");
+#else
+    // Non-Windows: FFmpeg, GStreamer
+    mediaBackendBox->addItem("FFmpeg", "ffmpeg");
+    mediaBackendBox->addItem("GStreamer", "gstreamer");
+#endif
+
+    // Set current backend from settings
+    QString currentBackend = GlobalSetting::instance().getMediaBackend();
+    int backendIndex = mediaBackendBox->findData(currentBackend);
+    if (backendIndex != -1) {
+        mediaBackendBox->setCurrentIndex(backendIndex);
+    }
+
+    QLabel *backendHintLabel = new QLabel(tr("Note: Changing media backend requires application restart to take effect."));
+    backendHintLabel->setStyleSheet("color: #666666; font-style: italic;");
+    backendHintLabel->setWordWrap(true);
+
+    // GStreamer Sink Priority Setting (non-Windows only)
+    QLabel *gstSinkLabel = new QLabel(tr("GStreamer Sink Priority: "));
+    gstSinkLabel->setStyleSheet(smallLabelFontSize);
+    gstSinkLabel->setObjectName("gstSinkLabel");
+
+    QLineEdit *gstSinkEdit = new QLineEdit();
+    gstSinkEdit->setObjectName("gstSinkEdit");
+    gstSinkEdit->setPlaceholderText("e.g. qt6videosink, xvimagesink, autovideosink");
+    gstSinkEdit->setText(GlobalSetting::instance().getGStreamerSinkPriority().join(", "));
+
+    QLabel *gstSinkHintLabel = new QLabel(tr("Comma-separated list of sinks to try in order."));
+    gstSinkHintLabel->setStyleSheet("color: #666666; font-style: italic;");
+    gstSinkHintLabel->setWordWrap(true);
+    gstSinkHintLabel->setObjectName("gstSinkHintLabel");
+
+    // Connect the media backend change signal
+    connect(mediaBackendBox, &QComboBox::currentIndexChanged, this, &VideoPage::onMediaBackendChanged);
+
+    // Hardware Acceleration Setting Section
+    QLabel *hwAccelLabel = new QLabel(tr("Hardware Acceleration: "));
+    hwAccelLabel->setStyleSheet(smallLabelFontSize);
+    hwAccelLabel->setObjectName("hwAccelLabel");
+
+    QComboBox *hwAccelBox = new QComboBox();
+    hwAccelBox->setObjectName("hwAccelBox");
+
+    QLabel *hwAccelHintLabel = new QLabel(tr("Note: Hardware acceleration improves performance but may not be available on all systems. Changing this setting requires application restart to take effect."));
+    hwAccelHintLabel->setStyleSheet("color: #666666; font-style: italic;");
+    hwAccelHintLabel->setWordWrap(true);
+    hwAccelHintLabel->setObjectName("hwAccelHintLabel");
+
+    // Set initial visibility based on backend
+    QString selectedBackend = mediaBackendBox->currentData().toString();
+    bool isFFmpeg = (selectedBackend == "ffmpeg");
+    bool isGStreamer = (selectedBackend == "gstreamer");
+
+    hwAccelLabel->setVisible(isFFmpeg);
+    hwAccelBox->setVisible(isFFmpeg);
+    hwAccelHintLabel->setVisible(isFFmpeg);
+
+#ifndef Q_OS_WIN
+    gstSinkLabel->setVisible(isGStreamer);
+    gstSinkEdit->setVisible(isGStreamer);
+    gstSinkHintLabel->setVisible(isGStreamer);
+#else
+    // GStreamer not available on Windows, always hide these
+    gstSinkLabel->setVisible(false);
+    gstSinkEdit->setVisible(false);
+    gstSinkHintLabel->setVisible(false);
+#endif
+
+    // Populate hardware acceleration options
+    if (m_cameraManager) {
+        MultimediaBackendHandler* backend = m_cameraManager->getBackendHandler();
+        if (backend) {
+            QStringList availableHwAccel = backend->getAvailableHardwareAccelerations();
+            hwAccelBox->clear();
+            for (const QString& hw : availableHwAccel) {
+                QString displayName;
+                if (hw == "auto") {
+                    displayName = tr("Auto (Recommended)");
+                } else if (hw == "cuda") {
+                    displayName = tr("NVIDIA CUDA");
+                } else if (hw == "qsv") {
+                    displayName = tr("Intel Quick Sync Video");
+                } else if (hw == "none") {
+                    displayName = tr("CPU");
+                } else {
+                    displayName = hw;
+                }
+                hwAccelBox->addItem(displayName, hw);
+            }
+
+            // Set current hardware acceleration from settings
+            QString currentHwAccel = GlobalSetting::instance().getHardwareAcceleration();
+            int hwIndex = hwAccelBox->findData(currentHwAccel);
+            if (hwIndex != -1) {
+                hwAccelBox->setCurrentIndex(hwIndex);
+            }
+        }
+    }
+
+    // Scaling Quality Setting Section
+    QLabel *scalingQualityLabel = new QLabel(tr("Image Quality: "));
+    scalingQualityLabel->setStyleSheet(smallLabelFontSize);
+
+    QComboBox *scalingQualityBox = new QComboBox();
+    scalingQualityBox->setObjectName("scalingQualityBox");
+    scalingQualityBox->addItem(tr("Fastest (Lower quality)"), "fast");
+    scalingQualityBox->addItem(tr("Balanced (Good quality)"), "balanced");
+    scalingQualityBox->addItem(tr("High Quality (Recommended)"), "quality");
+    scalingQualityBox->addItem(tr("Best Quality (Slower)"), "best");
+
+    // Set current scaling quality from settings
+    QString currentQuality = GlobalSetting::instance().getScalingQuality();
+    int qualityIndex = scalingQualityBox->findData(currentQuality);
+    if (qualityIndex != -1) {
+        scalingQualityBox->setCurrentIndex(qualityIndex);
+    } else {
+        // Default to "quality" (High Quality)
+        qualityIndex = scalingQualityBox->findData("quality");
+        if (qualityIndex != -1) {
+            scalingQualityBox->setCurrentIndex(qualityIndex);
+        }
+    }
+
+    QLabel *scalingQualityHintLabel = new QLabel(tr("Note: Higher quality settings provide sharper images but may use slightly more CPU."));
+    scalingQualityHintLabel->setStyleSheet("color: #666666; font-style: italic;");
+    scalingQualityHintLabel->setWordWrap(true);
+
+    // Add Capture Resolution elements to the layout
+    videoLayout->addWidget(hintLabel);
+    videoLayout->addWidget(resolutionsLabel);
+    videoLayout->addWidget(videoFormatBox);
+    videoLayout->addWidget(framerateLabel);
+    videoLayout->addLayout(hBoxLayout);
+    videoLayout->addWidget(formatLabel);
+    videoLayout->addWidget(pixelFormatBox);
+    videoLayout->addWidget(scalingQualityLabel);
+    videoLayout->addWidget(scalingQualityBox);
+    videoLayout->addWidget(scalingQualityHintLabel);
+    videoLayout->addWidget(separatorLine2);
+    videoLayout->addWidget(backendLabel);
+    videoLayout->addWidget(mediaBackendBox);
+    videoLayout->addWidget(backendHintLabel);
+    videoLayout->addWidget(gstSinkLabel);
+    videoLayout->addWidget(gstSinkEdit);
+    videoLayout->addWidget(gstSinkHintLabel);
+    videoLayout->addWidget(hwAccelLabel);
+    videoLayout->addWidget(hwAccelBox);
+    videoLayout->addWidget(hwAccelHintLabel);
+
+    // Add another separator
+    QFrame *separatorLine3 = new QFrame();
+    separatorLine3->setFrameShape(QFrame::HLine);
+    separatorLine3->setFrameShadow(QFrame::Sunken);
+    videoLayout->addWidget(separatorLine3);
+
+    // Rendering Quality Settings Section
+    QLabel *renderingQualityLabel = new QLabel(tr("Video Rendering Quality:"));
+    renderingQualityLabel->setStyleSheet(smallLabelFontSize);
+
+    QCheckBox *antialiasingCheckBox = new QCheckBox(tr("Enable Antialiasing (smoother edges)"));
+    antialiasingCheckBox->setObjectName("antialiasingCheckBox");
+    antialiasingCheckBox->setChecked(GlobalSetting::instance().getVideoAntialiasing());
+
+    QCheckBox *textAntialiasingCheckBox = new QCheckBox(tr("Enable Text Antialiasing (clearer text)"));
+    textAntialiasingCheckBox->setObjectName("textAntialiasingCheckBox");
+    textAntialiasingCheckBox->setChecked(GlobalSetting::instance().getVideoTextAntialiasing());
+
+    QCheckBox *smoothTransformCheckBox = new QCheckBox(tr("Enable Smooth Transform (better scaling)"));
+    smoothTransformCheckBox->setObjectName("smoothTransformCheckBox");
+    smoothTransformCheckBox->setChecked(GlobalSetting::instance().getVideoSmoothTransform());
+
+    QLabel *renderingQualityHintLabel = new QLabel(tr("Note: These settings control video display quality. Disabling may improve performance on slower systems."));
+    renderingQualityHintLabel->setStyleSheet("color: #666666; font-style: italic;");
+    renderingQualityHintLabel->setWordWrap(true);
+
+    videoLayout->addWidget(renderingQualityLabel);
+    videoLayout->addWidget(antialiasingCheckBox);
+    videoLayout->addWidget(textAntialiasingCheckBox);
+    videoLayout->addWidget(smoothTransformCheckBox);
+    videoLayout->addWidget(renderingQualityHintLabel);
+
+    videoLayout->addStretch();
+
+    // Button bar: Apply / Revert / Cancel (from PreferencePageBase)
+    createButtonBar(videoLayout);
+
+    // Connect dirty tracking for all settings widgets
+    connect(overrideSettingsCheckBox, &QCheckBox::toggled, this, [this]{ checkDirtyState(); });
+    connect(customInputWidthEdit, &QLineEdit::textChanged, this, [this]{ checkDirtyState(); });
+    connect(customInputHeightEdit, &QLineEdit::textChanged, this, [this]{ checkDirtyState(); });
+    connect(videoFormatBox, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int){ markDirty(); });
+    connect(fpsComboBox, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int){ markDirty(); });
+    connect(pixelFormatBox, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int){ markDirty(); });
+    connect(hwAccelBox, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int){ markDirty(); });
+    connect(scalingQualityBox, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int){ markDirty(); });
+    connect(antialiasingCheckBox, &QCheckBox::toggled, this, [this]{ checkDirtyState(); });
+    connect(textAntialiasingCheckBox, &QCheckBox::toggled, this, [this]{ checkDirtyState(); });
+    connect(smoothTransformCheckBox, &QCheckBox::toggled, this, [this]{ checkDirtyState(); });
+    connect(gstSinkEdit, &QLineEdit::textChanged, this, [this]{ checkDirtyState(); });
+
+    // Connect the checkbox state change to the slot
+    connect(overrideSettingsCheckBox, &QCheckBox::toggled, this, &VideoPage::toggleCustomResolutionInputs);
+
+    // Initialize the state of the custom resolution inputs
+    toggleCustomResolutionInputs(overrideSettingsCheckBox->isChecked());
+
+    // Note: Camera format enumeration removed with FFmpeg backend
+    // FFmpeg uses DirectShow/V4L2 format negotiation
+    if (m_cameraManager) {
+        // Populate with empty list (user can use custom resolution)
+        populateResolutionBox(QList<QCameraFormat>());
+
+        // Add default resolution options for FFmpeg backend
+        if (videoFormatBox->count() == 0) {
+            // Add common resolutions as defaults when no camera formats available
+            // Include the lower rates the capture chip offers (MS2109/MS2130
+            // expose 10/20/30/50/60 per resolution): on CPU-constrained hosts
+            // a lower framerate is the cheapest way to cut decode/display load.
+            std::set<int> defaultFps = {10, 20, 30, 60, 120};
+            QVariant fpsVariant = QVariant::fromValue<std::set<int>>(defaultFps);
+
+            videoFormatBox->addItem("1920x1080 [10 - 60 Hz]", fpsVariant);
+            videoFormatBox->addItem("1280x720 [10 - 60 Hz]", fpsVariant);
+            videoFormatBox->addItem("640x480 [10 - 60 Hz]", fpsVariant);
+
+            // Set default resolution
+            m_currentResolution = QSize(1920, 1080);
+        }
+
+        connect(videoFormatBox, &QComboBox::currentIndexChanged, [this](int /*index*/){
+            if (videoFormatBox->count() > 0) {
+                QString resolutionText = videoFormatBox->currentText();
+                QStringList resolutionParts = resolutionText.split(' ').first().split('x');
+                if (resolutionParts.size() >= 2) {
+                    m_currentResolution = QSize(resolutionParts[0].toInt(), resolutionParts[1].toInt());
+                }
+            }
+        });
+
+        // Only process if combobox has items
+        if (videoFormatBox->count() > 0) {
+            const std::set<int> fpsValues = boxValue(videoFormatBox).value<std::set<int>>();
+            setFpsRange(fpsValues);
+
+            QString resolutionText = videoFormatBox->currentText();
+            QStringList resolutionParts = resolutionText.split(' ').first().split('x');
+            if (resolutionParts.size() >= 2) {
+                m_currentResolution = QSize(resolutionParts[0].toInt(), resolutionParts[1].toInt());
+            }
+        }
+
+        updatePixelFormats();
+        // connect(pixelFormatBox, &QComboBox::currentIndexChanged, this,
+        //         &VideoPage::updatePixelFormats);
+    } else {
+        qWarning() << "CameraManager or Camera is not valid.";
+    }
+}
+
+void VideoPage::populateResolutionBox(const QList<QCameraFormat> &videoFormats) {
+    std::map<QSize, std::set<int>, QSizeComparator> resolutionSampleRates;
+
+    // Check if we're using GStreamer for special handling
+    QString mediaBackend = GlobalSetting::instance().getMediaBackend();
+    bool isGStreamer = (mediaBackend == "gstreamer");
+
+    // Process videoFormats to fill resolutionSampleRates and videoFormatMap
+    for (const QCameraFormat &format : videoFormats) {
+        QSize resolution = format.resolution();
+        int minFrameRate = format.minFrameRate();
+        int maxFrameRate = format.maxFrameRate();
+
+        if (isGStreamer) {
+            // For GStreamer, be very conservative - only use safe standard frame rates
+            std::vector<int> safeFrameRates = {5, 10, 15, 20, 24, 25, 30, 50, 60};
+
+            for (int safeRate : safeFrameRates) {
+                if (safeRate >= minFrameRate && safeRate <= maxFrameRate) {
+                    resolutionSampleRates[resolution].insert(safeRate);
+                }
+            }
+
+            // For GStreamer, DO NOT include actual min/max if they're not standard
+            // This prevents the step assertion error
+        } else {
+            // For other backends, use the original approach with standard rates
+            std::vector<int> standardFrameRates = {5, 10, 15, 20, 24, 25, 30, 50, 60, 120};
+
+            for (int stdRate : standardFrameRates) {
+                if (stdRate >= minFrameRate && stdRate <= maxFrameRate) {
+                    resolutionSampleRates[resolution].insert(stdRate);
+                }
+            }
+
+            // Always include the actual min and max if they're not standard values
+            resolutionSampleRates[resolution].insert(minFrameRate);
+            resolutionSampleRates[resolution].insert(maxFrameRate);
+        }
+    }
+
+    // Populate videoFormatBox with consolidated information
+    for (const auto &entry : resolutionSampleRates) {
+        const QSize &resolution = entry.first;
+        const std::set<int> &sampleRates = entry.second;
+
+        // Convert sampleRates to QStringList for printing
+        QStringList sampleRatesList;
+        for (int rate : sampleRates) {
+            sampleRatesList << QString::number(rate);
+        }
+
+        // Print all sampleRates
+
+        if (!sampleRates.empty()) {
+            int minSampleRate = *std::begin(sampleRates); // First element is the smallest
+            int maxSampleRate = *std::rbegin(sampleRates); // Last element is the largest
+            QString itemText = QString("%1x%2 [%3 - %4 Hz]").arg(resolution.width()).arg(resolution.height()).arg(minSampleRate).arg(maxSampleRate);
+
+            // Convert the entire set to QVariant
+            QVariant sampleRatesVariant = QVariant::fromValue<std::set<int>>(sampleRates);
+
+            QComboBox *videoFormatBox = this->findChild<QComboBox*>("videoFormatBox");
+            videoFormatBox->addItem(itemText, sampleRatesVariant);
+        }
+    }
+}
+
+void VideoPage::setFpsRange(const std::set<int> &fpsValues) {
+    if (!fpsValues.empty()) {
+        QComboBox *fpsComboBox = this->findChild<QComboBox*>("fpsComboBox");
+        fpsComboBox->clear();
+        int largestFps = *fpsValues.rbegin(); // Get the largest FPS value
+        for (int fps : fpsValues) {
+            fpsComboBox->addItem(QString::number(fps), fps);
+            if (fps == largestFps) {
+                fpsComboBox->setCurrentIndex(fpsComboBox->count() - 1);
+            }
+        }
+    }
+}
+
+void VideoPage::updatePixelFormats()
+{
+    if (m_updatingFormats)
+        return;
+    m_updatingFormats = true;
+
+    QComboBox *pixelFormatBox = this->findChild<QComboBox*>("pixelFormatBox");
+    pixelFormatBox->clear();
+
+    // Note: Pixel format enumeration removed with FFmpeg backend
+    // FFmpeg handles pixel format selection automatically
+    pixelFormatBox->addItem("Auto (FFmpeg)", QVariant::fromValue(0));
+    pixelFormatBox->setEnabled(false); // Disable as FFmpeg handles this
+
+    m_updatingFormats = false;
+}
+
+QVariant VideoPage::boxValue(const QComboBox *box) const
+{
+    const int idx = box->currentIndex();
+    return idx != -1 ? box->itemData(idx) : QVariant{};
+}
+
+void VideoPage::applySettings() {
+    QComboBox *fpsComboBox = this->findChild<QComboBox*>("fpsComboBox");
+    if (!fpsComboBox) {
+        qWarning() << "fpsComboBox not found!";
+        return;
+    }
+    int fps = fpsComboBox->currentData().toInt();
+
+    // Check if we're using GStreamer
+    QString mediaBackend = GlobalSetting::instance().getMediaBackend();
+    bool isGStreamer = (mediaBackend == "gstreamer");
+
+    if (isGStreamer) {
+    }
+
+    // Ensure pixelFormatBox is found
+    QComboBox *pixelFormatBox = this->findChild<QComboBox*>("pixelFormatBox");
+    if (!pixelFormatBox) {
+        qWarning() << "pixelFormatBox not found!";
+        return; // Early exit if pixelFormatBox is not found
+    }
+
+    // Extract the pixel format from the QVariant
+    QVariant pixelFormatVariant = boxValue(pixelFormatBox);
+    // Note: Camera format selection removed with FFmpeg backend
+    // FFmpeg negotiates formats directly with DirectShow/V4L2
+
+    // Save hardware acceleration setting
+    QComboBox *hwAccelBox = this->findChild<QComboBox*>("hwAccelBox");
+    if (hwAccelBox) {
+        QString hwAccel = hwAccelBox->currentData().toString();
+        GlobalSetting::instance().setHardwareAcceleration(hwAccel);
+    }
+
+    // Save scaling quality setting
+    QComboBox *scalingQualityBox = this->findChild<QComboBox*>("scalingQualityBox");
+    if (scalingQualityBox) {
+        QString quality = scalingQualityBox->currentData().toString();
+        GlobalSetting::instance().setScalingQuality(quality);
+    }
+
+    if (!m_cameraManager) {
+        qWarning() << "CameraManager is not valid!";
+        return;
+    }
+
+    // Save current device settings before stopping
+    // This prevents device path from being cleared during stop
+    QString savedPortChain = GlobalSetting::instance().getOpenterfacePortChain();
+
+    // Stop the camera if it is in an active status
+    try {
+        m_cameraManager->stopCamera();
+    } catch (const std::exception& e) {
+        qCritical() << "Error stopping camera:" << e.what();
+        return;
+    }
+
+    // CRITICAL FIX: Wait for capture thread to fully terminate
+    // This prevents crash when FFmpeg resources are accessed during cleanup
+
+    // Process events to ensure stop signal is handled
+    QApplication::processEvents();
+
+    // Reduced wait time since capture manager now handles proper thread termination
+    // Wait 200ms for thread to gracefully exit
+    QEventLoop loop;
+    QTimer::singleShot(200, &loop, &QEventLoop::quit);
+    loop.exec();
+
+    // Restore device settings before starting camera again
+    if (!savedPortChain.isEmpty()) {
+        GlobalSetting::instance().setOpenterfacePortChain(savedPortChain);
+    }
+
+    // Store settings for FFmpeg backend
+    handleResolutionSettings();
+
+    GlobalVar::instance().setCaptureWidth(m_currentResolution.width());
+    GlobalVar::instance().setCaptureHeight(m_currentResolution.height());
+    GlobalVar::instance().setCaptureFps(fps);
+
+    // Start the camera with the new settings
+    try{
+        m_cameraManager->startCamera();
+    } catch (const std::exception& e){
+        qCritical() << "Error starting camera: " << e.what();
+    }
+
+    updatePixelFormats();
+
+    GlobalSetting::instance().setVideoSettings(m_currentResolution.width(), m_currentResolution.height(), fps);
+
+    // Save rendering quality settings
+    QCheckBox *antialiasingCheckBox = this->findChild<QCheckBox*>("antialiasingCheckBox");
+    if (antialiasingCheckBox) {
+        GlobalSetting::instance().setVideoAntialiasing(antialiasingCheckBox->isChecked());
+    }
+
+    QCheckBox *textAntialiasingCheckBox = this->findChild<QCheckBox*>("textAntialiasingCheckBox");
+    if (textAntialiasingCheckBox) {
+        GlobalSetting::instance().setVideoTextAntialiasing(textAntialiasingCheckBox->isChecked());
+    }
+
+    QCheckBox *smoothTransformCheckBox = this->findChild<QCheckBox*>("smoothTransformCheckBox");
+    if (smoothTransformCheckBox) {
+        GlobalSetting::instance().setVideoSmoothTransform(smoothTransformCheckBox->isChecked());
+    }
+
+    // Emit the signal with the new width and height
+    emit videoSettingsChanged();
+
+    // Call StatusWidget to check for resolution mismatch and warn if needed
+    // Find the main window and then the status bar to access StatusWidget
+    QWidget *mainWidget = this;
+    while (mainWidget && mainWidget->parentWidget()) {
+        mainWidget = mainWidget->parentWidget();
+    }
+
+    // Try to find StatusWidget in the main window's children or in the status bar
+    StatusWidget *statusWidget = nullptr;
+    if (mainWidget) {
+        statusWidget = mainWidget->findChild<StatusWidget*>();
+    }
+
+    // If not found as direct child, try to find it in the application
+    if (!statusWidget) {
+        statusWidget = qobject_cast<StatusWidget*>(qApp->findChild<QObject*>("StatusWidget"));
+    }
+
+    if (statusWidget) {
+        statusWidget->checkAndWarnResolutionMismatch(m_currentResolution.width(), m_currentResolution.height(), static_cast<float>(fps));
+    } else {
+    }
+}
+
+void VideoPage::initVideoSettings() {
+    QSettings settings("Techxartisan", "Openterface");
+
+    int width = settings.value("video/width", 1920).toInt();
+    int height = settings.value("video/height", 1080).toInt();
+    int fps = settings.value("video/fps", 30).toInt();
+
+    m_currentResolution = QSize(width, height);
+
+    QComboBox *videoFormatBox = this->findChild<QComboBox*>("videoFormatBox");
+
+    // Set the resolution in the combo box
+    for (int i = 0; i < videoFormatBox->count(); ++i) {
+        QString resolutionText = videoFormatBox->itemText(i).split(' ').first();
+        QStringList resolutionParts = resolutionText.split('x');
+        if (resolutionParts.size() >= 2) {
+            if (resolutionParts[0].toInt() == width && resolutionParts[1].toInt() == height) {
+                videoFormatBox->setCurrentIndex(i);
+                break;
+            }
+        }
+    }
+
+    QComboBox *fpsComboBox = this->findChild<QComboBox*>("fpsComboBox");
+    int indexFps = fpsComboBox->findData(fps);
+    if (indexFps != -1) {
+        fpsComboBox->setCurrentIndex(indexFps);
+    }
+
+    // Set the media backend in the combo box
+    QComboBox *mediaBackendBox = this->findChild<QComboBox*>("mediaBackendBox");
+    if (mediaBackendBox) {
+        QString currentBackend = GlobalSetting::instance().getMediaBackend();
+        int backendIndex = mediaBackendBox->findData(currentBackend);
+        if (backendIndex != -1) {
+            mediaBackendBox->setCurrentIndex(backendIndex);
+        }
+    }
+
+    // Set the hardware acceleration in the combo box
+    QComboBox *hwAccelBox = this->findChild<QComboBox*>("hwAccelBox");
+    if (hwAccelBox) {
+        QString currentHwAccel = GlobalSetting::instance().getHardwareAcceleration();
+        int hwAccelIndex = hwAccelBox->findData(currentHwAccel);
+        if (hwAccelIndex != -1) {
+            hwAccelBox->setCurrentIndex(hwAccelIndex);
+        }
+    }
+
+    // Set the scaling quality in the combo box
+    QComboBox *scalingQualityBox = this->findChild<QComboBox*>("scalingQualityBox");
+    if (scalingQualityBox) {
+        QString currentQuality = GlobalSetting::instance().getScalingQuality();
+        int qualityIndex = scalingQualityBox->findData(currentQuality);
+        if (qualityIndex != -1) {
+            scalingQualityBox->setCurrentIndex(qualityIndex);
+        }
+    }
+
+    captureSnapshot();
+    clearDirty();
+}
+
+void VideoPage::handleResolutionSettings() {
+    QLineEdit *customInputWidthEdit = this->findChild<QLineEdit*>("customInputWidthEdit");
+    QLineEdit *customInputHeightEdit = this->findChild<QLineEdit*>("customInputHeightEdit");
+    QCheckBox *overrideSettingsCheckBox = this->findChild<QCheckBox*>("overrideSettingsCheckBox");
+
+    if (overrideSettingsCheckBox->isChecked()) {
+        GlobalVar::instance().setUseCustomInputResolution(true);
+        int customWidth = customInputWidthEdit->text().toInt();
+        int customHeight = customInputHeightEdit->text().toInt();
+        GlobalVar::instance().setInputWidth(customWidth);
+        GlobalVar::instance().setInputHeight(customHeight);
+    }else{
+        GlobalVar::instance().setUseCustomInputResolution(false);
+    }
+}
+
+void VideoPage::toggleCustomResolutionInputs(bool checked) {
+    QLineEdit *customInputWidthEdit = this->findChild<QLineEdit*>("customInputWidthEdit");
+    QLineEdit *customInputHeightEdit = this->findChild<QLineEdit*>("customInputHeightEdit");
+
+    // Enable or disable the input fields based on the checkbox state
+    customInputWidthEdit->setEnabled(checked);
+    customInputHeightEdit->setEnabled(checked);
+}
+
+void VideoPage::onMediaBackendChanged() {
+    QComboBox *mediaBackendBox = this->findChild<QComboBox*>("mediaBackendBox");
+    if (mediaBackendBox) {
+        QString selectedBackend = mediaBackendBox->currentData().toString();
+        GlobalSetting::instance().setMediaBackend(selectedBackend);
+
+        // FFmpeg features (hardware acceleration) are available on all platforms
+        bool isFFmpeg = (selectedBackend == "ffmpeg");
+        // GStreamer is only available on non-Windows
+        bool isGStreamer = (selectedBackend == "gstreamer");
+
+        // Find hardware acceleration widgets
+        QLabel *hwAccelLabel = this->findChild<QLabel*>("hwAccelLabel");
+        QComboBox *hwAccelBox = this->findChild<QComboBox*>("hwAccelBox");
+        QLabel *hwAccelHintLabel = this->findChild<QLabel*>("hwAccelHintLabel");
+
+        if (hwAccelLabel) hwAccelLabel->setVisible(isFFmpeg);
+        if (hwAccelBox) hwAccelBox->setVisible(isFFmpeg);
+        if (hwAccelHintLabel) hwAccelHintLabel->setVisible(isFFmpeg);
+
+        // Find GStreamer sink widgets
+        QLabel *gstSinkLabel = this->findChild<QLabel*>("gstSinkLabel");
+        QLineEdit *gstSinkEdit = this->findChild<QLineEdit*>("gstSinkEdit");
+        QLabel *gstSinkHintLabel = this->findChild<QLabel*>("gstSinkHintLabel");
+
+        if (gstSinkLabel) gstSinkLabel->setVisible(isGStreamer);
+        if (gstSinkEdit) gstSinkEdit->setVisible(isGStreamer);
+        if (gstSinkHintLabel) gstSinkHintLabel->setVisible(isGStreamer);
+
+        if (selectedBackend == "gstreamer") {
+        } else if (selectedBackend == "mediafoundation") {
+        } else if (selectedBackend == "ffmpeg") {
+        }
+    }
+}
+
+void VideoPage::captureSnapshot()
+{
+    m_snap_videoFormatIndex = videoFormatBox->currentIndex();
+    m_snap_pixelFormatIndex = pixelFormatBox->currentIndex();
+    m_snap_fpsIndex = fpsComboBox->currentIndex();
+    m_snap_resolution = m_currentResolution;
+
+    // Hardware acceleration
+    QComboBox *hwAccelBox = this->findChild<QComboBox*>("hwAccelBox");
+    m_snap_hwAccelIndex = hwAccelBox ? hwAccelBox->currentIndex() : -1;
+
+    // Scaling quality
+    QComboBox *scalingQualityBox = this->findChild<QComboBox*>("scalingQualityBox");
+    m_snap_scalingQualityIndex = scalingQualityBox ? scalingQualityBox->currentIndex() : -1;
+
+    // Rendering quality checkboxes
+    QCheckBox *antialiasingCheckBox = this->findChild<QCheckBox*>("antialiasingCheckBox");
+    m_snap_antialiasing = antialiasingCheckBox ? antialiasingCheckBox->isChecked() : false;
+
+    QCheckBox *textAntialiasingCheckBox = this->findChild<QCheckBox*>("textAntialiasingCheckBox");
+    m_snap_textAntialiasing = textAntialiasingCheckBox ? textAntialiasingCheckBox->isChecked() : false;
+
+    QCheckBox *smoothTransformCheckBox = this->findChild<QCheckBox*>("smoothTransformCheckBox");
+    m_snap_smoothTransform = smoothTransformCheckBox ? smoothTransformCheckBox->isChecked() : false;
+
+    // Media backend
+    QComboBox *mediaBackendBox = this->findChild<QComboBox*>("mediaBackendBox");
+    m_snap_mediaBackendIndex = mediaBackendBox ? mediaBackendBox->currentIndex() : -1;
+
+    // Custom resolution override
+    QCheckBox *overrideSettingsCheckBox = this->findChild<QCheckBox*>("overrideSettingsCheckBox");
+    m_snap_overrideSettings = overrideSettingsCheckBox ? overrideSettingsCheckBox->isChecked() : false;
+
+    QLineEdit *customInputWidthEdit = this->findChild<QLineEdit*>("customInputWidthEdit");
+    m_snap_customWidth = customInputWidthEdit ? customInputWidthEdit->text().toInt() : 0;
+
+    QLineEdit *customInputHeightEdit = this->findChild<QLineEdit*>("customInputHeightEdit");
+    m_snap_customHeight = customInputHeightEdit ? customInputHeightEdit->text().toInt() : 0;
+
+    // GStreamer sink priority
+    QLineEdit *gstSinkEdit = this->findChild<QLineEdit*>("gstSinkEdit");
+    m_snap_gstSinkPriority = gstSinkEdit ? gstSinkEdit->text() : QString();
+}
+
+void VideoPage::revertToSnapshot()
+{
+    videoFormatBox->setCurrentIndex(m_snap_videoFormatIndex);
+    pixelFormatBox->setCurrentIndex(m_snap_pixelFormatIndex);
+    fpsComboBox->setCurrentIndex(m_snap_fpsIndex);
+    m_currentResolution = m_snap_resolution;
+
+    // Restore video format box's derived resolution
+    if (videoFormatBox->count() > 0) {
+        QString resolutionText = videoFormatBox->currentText();
+        QStringList resolutionParts = resolutionText.split(' ').first().split('x');
+        if (resolutionParts.size() >= 2) {
+            m_currentResolution = QSize(resolutionParts[0].toInt(), resolutionParts[1].toInt());
+        }
+    }
+
+    // Hardware acceleration
+    QComboBox *hwAccelBox = this->findChild<QComboBox*>("hwAccelBox");
+    if (hwAccelBox && m_snap_hwAccelIndex >= 0) {
+        hwAccelBox->setCurrentIndex(m_snap_hwAccelIndex);
+    }
+
+    // Scaling quality
+    QComboBox *scalingQualityBox = this->findChild<QComboBox*>("scalingQualityBox");
+    if (scalingQualityBox && m_snap_scalingQualityIndex >= 0) {
+        scalingQualityBox->setCurrentIndex(m_snap_scalingQualityIndex);
+    }
+
+    // Rendering quality checkboxes
+    QCheckBox *antialiasingCheckBox = this->findChild<QCheckBox*>("antialiasingCheckBox");
+    if (antialiasingCheckBox) {
+        antialiasingCheckBox->setChecked(m_snap_antialiasing);
+    }
+
+    QCheckBox *textAntialiasingCheckBox = this->findChild<QCheckBox*>("textAntialiasingCheckBox");
+    if (textAntialiasingCheckBox) {
+        textAntialiasingCheckBox->setChecked(m_snap_textAntialiasing);
+    }
+
+    QCheckBox *smoothTransformCheckBox = this->findChild<QCheckBox*>("smoothTransformCheckBox");
+    if (smoothTransformCheckBox) {
+        smoothTransformCheckBox->setChecked(m_snap_smoothTransform);
+    }
+
+    // Media backend — restore combo, then trigger the visibility update slot
+    QComboBox *mediaBackendBox = this->findChild<QComboBox*>("mediaBackendBox");
+    if (mediaBackendBox && m_snap_mediaBackendIndex >= 0) {
+        mediaBackendBox->setCurrentIndex(m_snap_mediaBackendIndex);
+        onMediaBackendChanged();
+    }
+
+    // Custom resolution override
+    QCheckBox *overrideSettingsCheckBox = this->findChild<QCheckBox*>("overrideSettingsCheckBox");
+    if (overrideSettingsCheckBox) {
+        overrideSettingsCheckBox->setChecked(m_snap_overrideSettings);
+    }
+
+    QLineEdit *customInputWidthEdit = this->findChild<QLineEdit*>("customInputWidthEdit");
+    if (customInputWidthEdit) {
+        customInputWidthEdit->setText(QString::number(m_snap_customWidth));
+    }
+
+    QLineEdit *customInputHeightEdit = this->findChild<QLineEdit*>("customInputHeightEdit");
+    if (customInputHeightEdit) {
+        customInputHeightEdit->setText(QString::number(m_snap_customHeight));
+    }
+
+    // GStreamer sink priority
+    QLineEdit *gstSinkEdit = this->findChild<QLineEdit*>("gstSinkEdit");
+    if (gstSinkEdit) {
+        gstSinkEdit->setText(m_snap_gstSinkPriority);
+    }
+}
+
+bool VideoPage::valuesMatchSnapshot() const
+{
+    QComboBox *hwAccelBox = this->findChild<QComboBox*>("hwAccelBox");
+    QComboBox *scalingQualityBox = this->findChild<QComboBox*>("scalingQualityBox");
+    QCheckBox *antialiasingCheckBox = this->findChild<QCheckBox*>("antialiasingCheckBox");
+    QCheckBox *textAntialiasingCheckBox = this->findChild<QCheckBox*>("textAntialiasingCheckBox");
+    QCheckBox *smoothTransformCheckBox = this->findChild<QCheckBox*>("smoothTransformCheckBox");
+    QComboBox *mediaBackendBox = this->findChild<QComboBox*>("mediaBackendBox");
+    QCheckBox *overrideSettingsCheckBox = this->findChild<QCheckBox*>("overrideSettingsCheckBox");
+    QLineEdit *customInputWidthEdit = this->findChild<QLineEdit*>("customInputWidthEdit");
+    QLineEdit *customInputHeightEdit = this->findChild<QLineEdit*>("customInputHeightEdit");
+
+    return videoFormatBox->currentIndex() == m_snap_videoFormatIndex
+        && pixelFormatBox->currentIndex() == m_snap_pixelFormatIndex
+        && fpsComboBox->currentIndex() == m_snap_fpsIndex
+        && m_currentResolution == m_snap_resolution
+        && (hwAccelBox ? hwAccelBox->currentIndex() : -1) == m_snap_hwAccelIndex
+        && (scalingQualityBox ? scalingQualityBox->currentIndex() : -1) == m_snap_scalingQualityIndex
+        && (antialiasingCheckBox ? antialiasingCheckBox->isChecked() : false) == m_snap_antialiasing
+        && (textAntialiasingCheckBox ? textAntialiasingCheckBox->isChecked() : false) == m_snap_textAntialiasing
+        && (smoothTransformCheckBox ? smoothTransformCheckBox->isChecked() : false) == m_snap_smoothTransform
+        && (mediaBackendBox ? mediaBackendBox->currentIndex() : -1) == m_snap_mediaBackendIndex
+        && (overrideSettingsCheckBox ? overrideSettingsCheckBox->isChecked() : false) == m_snap_overrideSettings
+        && (customInputWidthEdit ? customInputWidthEdit->text().toInt() : 0) == m_snap_customWidth
+        && (customInputHeightEdit ? customInputHeightEdit->text().toInt() : 0) == m_snap_customHeight;
+}

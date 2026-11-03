@@ -1,0 +1,203 @@
+/*
+* ========================================================================== *
+*                                                                            *
+*    This file is part of the Openterface Mini KVM App QT version            *
+*                                                                            *
+*    Copyright (C) 2024   <info@openterface.com>                             *
+*                                                                            *
+*    This program is free software: you can redistribute it and/or modify    *
+*    it under the terms of the GNU General Public License as published by    *
+*    the Free Software Foundation version 3.                                 *
+*                                                                            *
+*    This program is distributed in the hope that it will be useful, but     *
+*    WITHOUT ANY WARRANTY; without even the implied warranty of              *
+*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU        *
+*    General Public License for more details.                                *
+*                                                                            *
+*    You should have received a copy of the GNU General Public License       *
+*    along with this program. If not, see <http://www.gnu.org/licenses/>.    *
+*                                                                            *
+* ========================================================================== *
+*/
+
+#ifndef VIDEOPANE_H
+#define VIDEOPANE_H
+
+#include "target/mouseeventdto.h"
+#include "inputhandler.h"
+
+#include <QtWidgets>
+#include <QtMultimedia>
+#include <QtMultimediaWidgets>
+#include <QLoggingCategory>
+
+Q_DECLARE_LOGGING_CATEGORY(log_ui_video)
+
+class VideoPane : public QGraphicsView
+{
+    Q_OBJECT
+
+public:
+    explicit VideoPane(QWidget *parent = nullptr);
+    ~VideoPane();
+
+    void showHostMouse();
+    void hideHostMouse();
+    void moveMouseToCenter();
+    void startEscTimer();
+    void stopEscTimer();
+
+    bool focusNextPrevChild(bool next) override;
+
+    bool isRelativeModeEnabled() const { return relativeModeEnable; }
+    void setRelativeModeEnabled(bool enable) { relativeModeEnable = enable; }
+
+    // QVideoWidget compatibility methods
+    void setAspectRatioMode(Qt::AspectRatioMode mode);
+    Qt::AspectRatioMode aspectRatioMode() const;
+    
+    // QGraphicsView enhancement methods
+    void setVideoItem(QGraphicsVideoItem* videoItem);
+    QGraphicsVideoItem* videoItem() const;
+    QGraphicsVideoItem* getVideoItem() const { return m_videoItem; } // Convenience method for external access
+    void resetZoom();
+    void zoomIn(double factor = 1.25);
+    void zoomOut(double factor = 0.8);
+    void centerOn(const QPointF &pos); // Center the view on a specific point
+    void fitToWindow();
+    void actualSize();
+    
+    // Direct GStreamer support methods (based on widgets_main.cpp approach)
+    void enableDirectGStreamerMode(bool enable = true);
+    bool isDirectGStreamerModeEnabled() const { return m_directGStreamerMode; }
+    WId getVideoOverlayWindowId() const;
+    void setupForGStreamerOverlay();
+    QWidget* getOverlayWidget() const { return m_overlayWidget; }
+        
+    // FFmpeg direct video frame support
+    void updateVideoFrame(const QPixmap& frame);
+    void updateVideoFrameFromImage(const QImage& image);  // Optimized: receives QImage, converts to QPixmap on GUI thread
+    void updateGraphicsVideoItemFromImage(QGraphicsVideoItem* videoItem, const QImage& image);  // Updates QGraphicsVideoItem from QImage
+    void enableDirectFFmpegMode(bool enable = true);
+    bool isDirectFFmpegModeEnabled() const { return m_directFFmpegMode; }
+    void clearVideoFrame(); // Clear the current video frame display
+
+    // Mouse position transformation for InputHandler
+    QPointF getTransformedMousePosition(const QPoint& viewportPos);
+    void setOriginalVideoSize(const QSize& size) { m_originalVideoSize = size; }
+    QSize getOriginalVideoSize() const { return m_originalVideoSize; }
+    QRectF getGStreamerVideoContentRect() const;
+
+    // Active (non-black) area of the displayed video, normalized to 0..1 of the
+    // frame. Capture chips pad signals whose aspect ratio differs from the USB
+    // stream (e.g. 4:3 source in a 16:9 frame) with black bars that are not
+    // part of the target desktop.
+    QRectF getActiveContentRectNormalized() const;
+    static QRectF computeActiveContentRectNormalized(const QSize& frameSize, const QSize& inputSize);
+    
+    // Debug helper to validate coordinate transformation consistency
+    void validateMouseCoordinates(const QPoint& original, const QString& eventType);
+    
+    // Get current zoom factor
+    double getZoomFactor() const { return m_scaleFactor; }
+    
+    // Set coordinate correction for zoom mode
+    void setZoomOffsetCorrection(int x, int y) { m_zoomOffsetCorrectionX = x; m_zoomOffsetCorrectionY = y; }
+
+    // rendering quality control (toggle antialiasing hints)
+    void setRenderQuality(bool highQuality);
+    bool renderQualityHigh() const { return m_highQualityRendering; }
+
+    // Get InputHandler for connecting signals
+    InputHandler* getInputHandler() const { return m_inputHandler; }
+
+signals:
+    void mouseMoved(const QPoint& position, const QString& event);
+    void videoPaneResized(const QSize& newSize);  // Signal for video pane resize events
+    void viewportSizeChanged(const QSize& size);   // Signal for viewport size changes
+    void newVideoFrameReceived();                  // Emitted when a new video frame is displayed
+
+public slots:
+    void onCameraDeviceSwitching(const QString& fromDevice, const QString& toDevice);
+    void onCameraDeviceSwitchComplete(const QString& device);
+    void onCameraActiveChanged(bool active);
+
+    /// Handle keyboard events captured by SystemKeyBlocker's native hook.
+    /// Constructs a QKeyEvent and routes it through the same InputHandler path
+    /// as normal keyPressEvent(), ensuring unified keyboard handling.
+    void handleCapturedKey(int qtKeyCode, int modifiers, bool isKeyDown, quint32 nativeVk);
+
+protected:
+    bool event(QEvent *event) override;
+    void paintEvent(QPaintEvent *event) override;
+    void wheelEvent(QWheelEvent *event) override;
+    void mousePressEvent(QMouseEvent *event) override;
+    void mouseMoveEvent(QMouseEvent *event) override;
+    void mouseReleaseEvent(QMouseEvent *event) override;
+    void resizeEvent(QResizeEvent *event) override;
+    void keyPressEvent(QKeyEvent *event) override;
+    void keyReleaseEvent(QKeyEvent *event) override;
+    void focusOutEvent(QFocusEvent *event) override;
+
+private:
+    int lastX=0;
+    int lastY=0;
+    bool relativeModeEnable;
+    
+    InputHandler *m_inputHandler;
+
+    QTimer *escTimer;
+    bool holdingEsc=false;
+    
+    // Frame preservation during camera switching
+    QPixmap m_lastFrame;
+    bool m_isCameraSwitching;
+    
+    // Graphics framework components
+    QGraphicsScene *m_scene;
+    QGraphicsVideoItem *m_videoItem;
+    QGraphicsPixmapItem *m_pixmapItem;  // For displaying static frames
+    
+    // Aspect ratio and zoom control
+    Qt::AspectRatioMode m_aspectRatioMode;
+    double m_scaleFactor;
+    QSize m_originalVideoSize;
+    bool m_maintainAspectRatio;
+    
+    // Coordinate correction for zoom mode
+    int m_zoomOffsetCorrectionX;
+    int m_zoomOffsetCorrectionY;
+    
+    // Direct GStreamer mode support
+    bool m_directGStreamerMode;
+    QWidget* m_overlayWidget; // Widget for direct video overlay
+    qint64 m_lastGStreamerUpdateTime; // Debounce repeated geometry updates
+    
+    // Direct FFmpeg mode support
+    bool m_directFFmpegMode;
+    QSize m_lastViewportSize;
+    bool m_frameIsViewportSized;
+
+    // rendering quality hint flag (true=antialiasing enabled)
+    bool m_highQualityRendering;
+    
+    // Zoom hint label and control
+    QLabel* m_zoomHintLabel;
+    bool m_zoomHintShown;
+    QTimer* m_zoomHintTimer;
+    
+    MouseEventDTO* calculateRelativePosition(QMouseEvent *event);
+    MouseEventDTO* calculateAbsolutePosition(QMouseEvent *event);
+    MouseEventDTO* calculateMouseEventDto(QMouseEvent *event);
+    
+    void captureCurrentFrame();
+    void updateVideoItemTransform();
+    void updateOverlayWidgetGeometry();
+    void centerVideoItem();
+    void setupScene();
+    void updateScrollBarsAndSceneRect();
+    void showZoomHint();
+    void startZoomHintFadeOut();
+};
+
+#endif

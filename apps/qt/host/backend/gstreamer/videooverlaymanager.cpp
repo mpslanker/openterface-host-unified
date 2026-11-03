@@ -1,0 +1,486 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+#include "videooverlaymanager.h"
+
+#include <QDebug>
+#include "logging.h"
+#include <QGuiApplication>
+
+#ifdef HAVE_GSTREAMER
+#include <gst/gst.h>
+#include <gst/video/videooverlay.h>
+#endif
+
+#include "../../../ui/videopane.h"
+
+#ifdef Q_OS_LINUX
+#include <X11/Xlib.h>
+#include <X11/Xutil.h>
+static bool x11_overlay_error_occurred_local = false;
+static int x11_overlay_error_handler_local(Display* /*display*/, XErrorEvent* /*error*/) {
+    x11_overlay_error_occurred_local = true;
+    return 0;
+}
+#endif
+
+#include "log/opflogging.h"
+OPF_LOGGING_CATEGORY(log_gstreamer_videooverlaymanager, "opf.backend.videooverlaymanager")
+
+using namespace Openterface::GStreamer;
+
+bool VideoOverlayManager::embedVideoInWidget(void* pipeline, QWidget* widget)
+{
+#ifdef HAVE_GSTREAMER
+    if (!widget || !pipeline) {
+        qCWarning(log_gstreamer_videooverlaymanager) << "Cannot embed video: widget or pipeline is null";
+        return false;
+    }
+
+    GstElement* videoSink = gst_bin_get_by_name(GST_BIN(pipeline), "videosink");
+    if (!videoSink) {
+        qCWarning(log_gstreamer_videooverlaymanager) << "No video sink element named 'videosink' found in pipeline";
+        videoSink = gst_bin_get_by_interface(GST_BIN(pipeline), GST_TYPE_VIDEO_OVERLAY);
+        if (!videoSink) {
+            qCWarning(log_gstreamer_videooverlaymanager) << "No video overlay interface found in pipeline either";
+            return false;
+        }
+    }
+
+    WId winId = widget->winId();
+    if (winId) {
+        qCDebug(log_gstreamer_videooverlaymanager) << "Embedding video in widget with window ID:" << winId;
+        gst_video_overlay_set_window_handle(GST_VIDEO_OVERLAY(videoSink), winId);
+        gst_object_unref(videoSink);
+        qCDebug(log_gstreamer_videooverlaymanager) << "Video embedded in widget successfully";
+        return true;
+    } else {
+        qCWarning(log_gstreamer_videooverlaymanager) << "Widget window ID is null, cannot embed video";
+        gst_object_unref(videoSink);
+        return false;
+    }
+#else
+    Q_UNUSED(pipeline)
+    Q_UNUSED(widget)
+    qCDebug(log_gstreamer_videooverlaymanager) << "Using autovideosink for video output (no in-process GStreamer)";
+    return true;
+#endif
+}
+
+bool VideoOverlayManager::embedVideoInGraphicsView(void* pipeline, QGraphicsView* view)
+{
+#ifdef HAVE_GSTREAMER
+    if (!view || !pipeline) {
+        qCWarning(log_gstreamer_videooverlaymanager) << "Cannot embed video: graphics view or pipeline is null";
+        return false;
+    }
+
+    GstElement* videoSink = gst_bin_get_by_name(GST_BIN(pipeline), "videosink");
+    if (!videoSink) {
+        qCWarning(log_gstreamer_videooverlaymanager) << "No video sink element named 'videosink' found in pipeline";
+        videoSink = gst_bin_get_by_interface(GST_BIN(pipeline), GST_TYPE_VIDEO_OVERLAY);
+        if (!videoSink) {
+            qCWarning(log_gstreamer_videooverlaymanager) << "No video overlay interface found in pipeline either";
+            return false;
+        }
+    }
+
+    WId winId = view->winId();
+    if (winId) {
+        qCDebug(log_gstreamer_videooverlaymanager) << "Embedding video in graphics view with window ID:" << winId;
+        gst_video_overlay_set_window_handle(GST_VIDEO_OVERLAY(videoSink), winId);
+        gst_object_unref(videoSink);
+        qCDebug(log_gstreamer_videooverlaymanager) << "Video embedded in graphics view successfully";
+        return true;
+    } else {
+        qCWarning(log_gstreamer_videooverlaymanager) << "Graphics view window ID is null, cannot embed video";
+        gst_object_unref(videoSink);
+        return false;
+    }
+#else
+    Q_UNUSED(pipeline)
+    Q_UNUSED(view)
+    qCDebug(log_gstreamer_videooverlaymanager) << "Using autovideosink for video output (no in-process GStreamer)";
+    return true;
+#endif
+}
+
+bool VideoOverlayManager::embedVideoInVideoPane(void* pipeline, ::VideoPane* videoPane)
+{
+#ifdef HAVE_GSTREAMER
+    if (!videoPane || !pipeline) {
+        qCWarning(log_gstreamer_videooverlaymanager) << "Cannot embed video: VideoPane or pipeline is null";
+        return false;
+    }
+
+    GstElement* videoSink = gst_bin_get_by_name(GST_BIN(pipeline), "videosink");
+    if (!videoSink) {
+        qCWarning(log_gstreamer_videooverlaymanager) << "No video sink element named 'videosink' found in pipeline";
+        videoSink = gst_bin_get_by_interface(GST_BIN(pipeline), GST_TYPE_VIDEO_OVERLAY);
+        if (!videoSink) {
+            qCWarning(log_gstreamer_videooverlaymanager) << "No video overlay interface found in pipeline either";
+            return false;
+        }
+    }
+
+    WId winId = videoPane->getVideoOverlayWindowId();
+    if (winId) {
+        qCDebug(log_gstreamer_videooverlaymanager) << "Embedding video in VideoPane overlay with window ID:" << winId;
+        gst_video_overlay_set_window_handle(GST_VIDEO_OVERLAY(videoSink), winId);
+        gst_object_unref(videoSink);
+        qCDebug(log_gstreamer_videooverlaymanager) << "Video embedded in VideoPane overlay successfully";
+        return true;
+    } else {
+        qCWarning(log_gstreamer_videooverlaymanager) << "VideoPane overlay window ID is null, cannot embed video";
+        gst_object_unref(videoSink);
+        return false;
+    }
+#else
+    Q_UNUSED(pipeline)
+    Q_UNUSED(videoPane)
+    qCDebug(log_gstreamer_videooverlaymanager) << "Using autovideosink for video output (no in-process GStreamer)";
+    return true;
+#endif
+}
+
+bool VideoOverlayManager::setupVideoOverlay(void* videoSinkPtr, WId windowId, const QSize& videoResolution, QWidget* videoWidget, QGraphicsVideoItem* graphicsVideoItem)
+{
+#ifdef HAVE_GSTREAMER
+    if (!videoSinkPtr || windowId == 0) {
+        qCWarning(log_gstreamer_videooverlaymanager) << "Invalid parameters for overlay setup: sink=" << videoSinkPtr << "windowId=" << windowId;
+        return false;
+    }
+
+    GstElement* videoSink = static_cast<GstElement*>(videoSinkPtr);
+
+    // Log sink and target geometry for diagnostics
+    const GstElementFactory* factory = gst_element_get_factory(videoSink);
+    const gchar* sinkName = factory ? gst_plugin_feature_get_name(GST_PLUGIN_FEATURE(factory)) : "unknown";
+    qCDebug(log_gstreamer_videooverlaymanager) << "Overlay setup: sink=" << (sinkName ? sinkName : "unknown")
+                                   << "windowId=" << windowId
+                                   << "videoResolution=" << videoResolution
+                                   << "videoWidgetSize=" << (videoWidget ? videoWidget->size() : QSize())
+                                   << "graphicsVideoItemSize=" << (graphicsVideoItem ? graphicsVideoItem->boundingRect().size() : QSizeF());
+    if (factory) gst_object_unref((GstObject*)factory);
+
+    // Check if the sink supports video overlay interface
+    if (GST_IS_VIDEO_OVERLAY(videoSink)) {
+        qCDebug(log_gstreamer_videooverlaymanager) << "Sink supports video overlay - setting up overlay with window ID:" << windowId;
+
+#ifdef Q_OS_LINUX
+        // Add X11 error handling to prevent segmentation fault
+        XErrorHandler old_handler = nullptr;
+        Display* display = nullptr;
+        if (QGuiApplication::platformName().contains("xcb")) {
+            x11_overlay_error_occurred_local = false;
+            display = XOpenDisplay(nullptr);
+            if (display) {
+                old_handler = XSetErrorHandler(x11_overlay_error_handler_local);
+            }
+        }
+#endif
+
+        // Add error handling for the overlay setup to prevent crashes
+        try {
+            gst_video_overlay_set_window_handle(GST_VIDEO_OVERLAY(videoSink), windowId);
+
+            // For sinks that support force-aspect-ratio (Qt/GTK sinks), enable it for auto-centering.
+            // For X11 sinks (xvimagesink/ximagesink) that don't have this property, we manually
+            // calculate an aspect-ratio-preserving render rectangle below.
+            if (g_object_class_find_property(G_OBJECT_GET_CLASS(videoSink), "force-aspect-ratio")) {
+                g_object_set(videoSink, "force-aspect-ratio", FALSE, NULL);
+                qCDebug(log_gstreamer_videooverlaymanager) << "Disabled force-aspect-ratio on video sink so overlay fills render rectangle";
+            }
+
+            if (g_object_class_find_property(G_OBJECT_GET_CLASS(videoSink), "pixel-aspect-ratio")) {
+                g_object_set(videoSink, "pixel-aspect-ratio", "1/1", NULL);
+                qCDebug(log_gstreamer_videooverlaymanager) << "Set pixel-aspect-ratio to 1:1 on video sink";
+            }
+
+            // Configure render rectangle - the pipeline already scales the video with
+            // add-borders=true, so we just fill the entire widget area. For X11 sinks
+            // (xvimagesink/ximagesink) where render rectangle is applied as clipping,
+            // clamp the rectangle to the visible screen area.
+            if (videoWidget) {
+                QSize widgetSize = videoWidget->size();
+                QPoint renderOffset(0, 0);
+                QSize renderSize = widgetSize;
+                QScreen* screen = nullptr;
+                qreal screenDpr = 1.0;
+                QRect visibleRect;
+
+                if (QWidget* topLevel = videoWidget->window()) {
+                    if (QWindow* windowHandle = topLevel->windowHandle()) {
+                        screen = windowHandle->screen();
+                        if (screen) {
+                            screenDpr = screen->devicePixelRatio();
+                        }
+                    }
+                }
+                if (!screen) {
+                    screen = QGuiApplication::primaryScreen();
+                    if (screen) {
+                        screenDpr = screen->devicePixelRatio();
+                    }
+                }
+
+                QRect overlayGlobalRect(videoWidget->mapToGlobal(QPoint(0, 0)), widgetSize);
+                if (screen) {
+                    QSize screenSize = screen->availableGeometry().size();
+                    QSize screenPhysical = (screenDpr > 1.0)
+                        ? QSize(qRound(screenSize.width() * screenDpr), qRound(screenSize.height() * screenDpr))
+                        : screenSize;
+                    visibleRect = overlayGlobalRect.intersected(screen->availableGeometry());
+
+                    qCDebug(log_gstreamer_videooverlaymanager) << "Overlay widget size:" << widgetSize
+                                                           << "screen logical:" << screenSize
+                                                           << "screen physical:" << screenPhysical
+                                                           << "screenDPR:" << screenDpr
+                                                           << "overlay global rect:" << overlayGlobalRect
+                                                           << "visible rect:" << visibleRect;
+
+                    if (visibleRect.isValid() && visibleRect.size() != widgetSize) {
+                        renderSize = visibleRect.size();
+                        renderOffset = visibleRect.topLeft() - overlayGlobalRect.topLeft();
+                        qCDebug(log_gstreamer_videooverlaymanager) << "Render rectangle localized to visible overlay region:" << renderOffset << renderSize;
+                    }
+                    if (!screenPhysical.isEmpty() && renderSize.width() > screenPhysical.width()) {
+                        qCDebug(log_gstreamer_videooverlaymanager) << "Clamping render rectangle width" << renderSize.width()
+                                                               << "to screen physical width" << screenPhysical.width();
+                        renderSize.setWidth(screenPhysical.width());
+                    }
+                    if (!screenPhysical.isEmpty() && renderSize.height() > screenPhysical.height()) {
+                        qCDebug(log_gstreamer_videooverlaymanager) << "Clamping render rectangle height" << renderSize.height()
+                                                               << "to screen physical height" << screenPhysical.height();
+                        renderSize.setHeight(screenPhysical.height());
+                    }
+                }
+                if (renderSize.width() > 0 && renderSize.height() > 0) {
+                    gst_video_overlay_set_render_rectangle(GST_VIDEO_OVERLAY(videoSink), renderOffset.x(), renderOffset.y(), renderSize.width(), renderSize.height());
+                    gst_video_overlay_expose(GST_VIDEO_OVERLAY(videoSink));
+                    qCDebug(log_gstreamer_videooverlaymanager) << "Set render rectangle to:" << QRect(renderOffset, renderSize);
+                }
+            } else if (graphicsVideoItem) {
+                QRectF itemRect = graphicsVideoItem->boundingRect();
+                if (itemRect.width() > 0 && itemRect.height() > 0) {
+                    gst_video_overlay_set_render_rectangle(GST_VIDEO_OVERLAY(videoSink), 0, 0, (gint)itemRect.width(), (gint)itemRect.height());
+                    qCDebug(log_gstreamer_videooverlaymanager) << "Set render rectangle to video item size:" << itemRect.size();
+                }
+            }
+
+#ifdef Q_OS_LINUX
+            if (display && old_handler) {
+                XSync(display, False); // Force any pending X requests to be processed
+                XSetErrorHandler(old_handler);
+                XCloseDisplay(display);
+
+                if (x11_overlay_error_occurred_local) {
+                    qCWarning(log_gstreamer_videooverlaymanager) << "X11 error occurred during overlay setup - continuing without embedding";
+                } else {
+                    qCDebug(log_gstreamer_videooverlaymanager) << "Video overlay setup completed successfully";
+                }
+            } else if (!old_handler) {
+                qCDebug(log_gstreamer_videooverlaymanager) << "Video overlay setup completed (no X11 error handling)";
+            }
+#endif
+
+            qCDebug(log_gstreamer_videooverlaymanager) << "Overlay setup completed";
+        } catch (...) {
+            qCCritical(log_gstreamer_videooverlaymanager) << "Exception during video overlay setup - continuing without embedding";
+#ifdef Q_OS_LINUX
+            if (display && old_handler) {
+                XSetErrorHandler(old_handler);
+                XCloseDisplay(display);
+            }
+#endif
+            return false;
+        }
+
+        return true;
+    }
+
+    // For autovideosink, try to get the actual sink it selected and set up overlay on that
+    const GstElementFactory* autovideosinkFactory = gst_element_get_factory(videoSink);
+    const gchar* autovideosinkName = autovideosinkFactory ? gst_plugin_feature_get_name(GST_PLUGIN_FEATURE(autovideosinkFactory)) : "unknown";
+    const QByteArray sinkNameBA = QByteArray(autovideosinkName);
+
+    if (autovideosinkFactory) gst_object_unref((GstObject*)autovideosinkFactory);
+
+    if (sinkNameBA.contains("autovideo")) {
+        GstElement* actualSink = nullptr;
+        if (GST_IS_BIN(videoSink)) {
+            GstIterator* iter = gst_bin_iterate_sinks(GST_BIN(videoSink));
+            GValue item = G_VALUE_INIT;
+            if (gst_iterator_next(iter, &item) == GST_ITERATOR_OK) {
+                actualSink = GST_ELEMENT(g_value_get_object(&item));
+                if (actualSink && GST_IS_VIDEO_OVERLAY(actualSink)) {
+                    qCDebug(log_gstreamer_videooverlaymanager) << "Found overlay-capable sink inside autovideosink";
+                    gst_video_overlay_set_window_handle(GST_VIDEO_OVERLAY(actualSink), windowId);
+                    if (videoWidget) {
+                        QSize widgetSize = videoWidget->size();
+                        if (widgetSize.width() > 0 && widgetSize.height() > 0) {
+                            gst_video_overlay_set_render_rectangle(GST_VIDEO_OVERLAY(actualSink), 0, 0, widgetSize.width(), widgetSize.height());
+                            qCDebug(log_gstreamer_videooverlaymanager) << "Set render rectangle to widget size for autovideosink child sink:" << widgetSize;
+                        } else {
+                            gst_video_overlay_set_render_rectangle(GST_VIDEO_OVERLAY(actualSink), 0, 0, -1, -1);
+                        }
+                    } else {
+                        gst_video_overlay_set_render_rectangle(GST_VIDEO_OVERLAY(actualSink), 0, 0, -1, -1);
+                    }
+                    gst_video_overlay_expose(GST_VIDEO_OVERLAY(actualSink));
+                    g_value_unset(&item);
+                    gst_iterator_free(iter);
+                    return true;
+                }
+                g_value_unset(&item);
+            }
+            gst_iterator_free(iter);
+        }
+        qCDebug(log_gstreamer_videooverlaymanager) << "autovideosink selected sink doesn't support overlay - video will display in separate window";
+        return false;
+    }
+
+    qCWarning(log_gstreamer_videooverlaymanager) << "Sink does not support video overlay:" << sinkName;
+    return false;
+#else
+    Q_UNUSED(videoSinkPtr)
+    Q_UNUSED(windowId)
+    Q_UNUSED(videoWidget)
+    Q_UNUSED(graphicsVideoItem)
+    qCDebug(log_gstreamer_videooverlaymanager) << "No in-process GStreamer - overlay unavailable";
+    return false;
+#endif
+}
+
+bool VideoOverlayManager::setupVideoOverlayForPipeline(void* pipeline, WId windowId, const QSize& videoResolution, QWidget* videoWidget, QGraphicsVideoItem* graphicsVideoItem)
+{
+#ifdef HAVE_GSTREAMER
+    if (!pipeline) return false;
+
+    GstElement* videoSink = gst_bin_get_by_name(GST_BIN(pipeline), "videosink");
+    if (!videoSink) {
+        videoSink = gst_bin_get_by_interface(GST_BIN(pipeline), GST_TYPE_VIDEO_OVERLAY);
+    }
+
+    if (videoSink) {
+        bool ok = setupVideoOverlay(videoSink, windowId, videoResolution, videoWidget, graphicsVideoItem);
+        gst_object_unref(videoSink);
+        return ok;
+    }
+    qCWarning(log_gstreamer_videooverlaymanager) << "No video sink found in pipeline";
+    return false;
+#else
+    Q_UNUSED(pipeline)
+    Q_UNUSED(windowId)
+    return false;
+#endif
+}
+
+bool VideoOverlayManager::completePendingOverlaySetup(void* pipeline,
+                                                    QWidget* videoWidget,
+                                                    QGraphicsVideoItem* graphicsVideoItem,
+                                                    ::VideoPane* videoPane,
+                                                    bool &pendingFlag)
+{
+    qCDebug(log_gstreamer_videooverlaymanager) << "VideoOverlayManager: Completing pending overlay setup...";
+
+    if (!pendingFlag || !pipeline) {
+        qCDebug(log_gstreamer_videooverlaymanager) << "No pending setup or no pipeline";
+        return false;
+    }
+
+    const QString platform = QGuiApplication::platformName();
+    const bool isXcb = platform.contains("xcb", Qt::CaseInsensitive);
+    const bool hasXDisplay = !qgetenv("DISPLAY").isEmpty();
+    if (!isXcb || !hasXDisplay) {
+        qCWarning(log_gstreamer_videooverlaymanager) << "Skipping deferred overlay setup: platform is" << platform << "(DISPLAY set:" << hasXDisplay << ")";
+        pendingFlag = false;
+        return false;
+    }
+
+    WId windowId = 0;
+
+    if (videoPane) {
+        windowId = videoPane->getVideoOverlayWindowId();
+        qCDebug(log_gstreamer_videooverlaymanager) << "Completing overlay setup with VideoPane window ID:" << windowId;
+    } else if (graphicsVideoItem) {
+        if (graphicsVideoItem->scene()) {
+            QList<QGraphicsView*> views = graphicsVideoItem->scene()->views();
+            if (!views.isEmpty()) {
+                QGraphicsView* view = views.first();
+                if (auto pane = qobject_cast<VideoPane*>(view)) {
+                    if (pane->isDirectGStreamerModeEnabled() && pane->getOverlayWidget()) {
+                        windowId = pane->getVideoOverlayWindowId();
+                        qCDebug(log_gstreamer_videooverlaymanager) << "Completing overlay setup with VideoPane overlay widget window ID:" << windowId;
+                    } else {
+                        qCDebug(log_gstreamer_videooverlaymanager) << "VideoPane overlay widget still not ready";
+                        return false;
+                    }
+                } else {
+                    windowId = view->winId();
+                    qCDebug(log_gstreamer_videooverlaymanager) << "Completing overlay setup with graphics view window ID:" << windowId;
+                }
+            } else {
+                qCWarning(log_gstreamer_videooverlaymanager) << "Graphics video item has no associated view";
+                return false;
+            }
+        } else {
+            qCWarning(log_gstreamer_videooverlaymanager) << "Graphics video item has no scene";
+            return false;
+        }
+    }
+
+    if (windowId && windowId != 0) {
+        GstElement* videoSink = gst_bin_get_by_name(GST_BIN(pipeline), "videosink");
+        if (!videoSink) {
+            videoSink = gst_bin_get_by_interface(GST_BIN(pipeline), GST_TYPE_VIDEO_OVERLAY);
+            if (videoSink) qCDebug(log_gstreamer_videooverlaymanager) << "Deferred path: found sink by overlay interface";
+        }
+
+        if (videoSink) {
+            const GstElementFactory* factory = gst_element_get_factory(videoSink);
+            const gchar* sinkName = factory ? gst_plugin_feature_get_name(GST_PLUGIN_FEATURE(factory)) : "unknown";
+            if (!sinkName) sinkName = "unknown";
+
+            const QByteArray sinkNameBA = QByteArray(sinkName);
+            if (sinkNameBA.contains("qt6videosink")) {
+                QWidget* targetWidget = nullptr;
+                if (videoPane && videoPane->getOverlayWidget()) {
+                    targetWidget = videoPane->getOverlayWidget();
+                } else if (videoWidget) {
+                    targetWidget = videoWidget;
+                }
+                if (targetWidget) {
+                    qCDebug(log_gstreamer_videooverlaymanager) << "Deferred: binding qt6videosink to QWidget" << targetWidget;
+                    g_object_set(G_OBJECT(videoSink), "widget", (gpointer)targetWidget, nullptr);
+                    gst_object_unref(videoSink);
+                    pendingFlag = false;
+                    qCDebug(log_gstreamer_videooverlaymanager) << "Deferred qt6videosink binding completed";
+                    return true;
+                } else {
+                    qCWarning(log_gstreamer_videooverlaymanager) << "Deferred: no target QWidget available to bind qt6videosink";
+                }
+            }
+
+            const bool supportsOverlay = GST_IS_VIDEO_OVERLAY(videoSink);
+
+            if (!supportsOverlay) {
+                qCWarning(log_gstreamer_videooverlaymanager) << "Deferred overlay skipped: sink does not support overlay interface (" << sinkName << ")";
+                gst_object_unref(videoSink);
+                // Keep pendingFlag true so we can retry later when sink may change
+                return false;
+            }
+
+            qCDebug(log_gstreamer_videooverlaymanager) << "Setting up deferred video overlay with window ID:" << windowId << "using sink" << sinkName;
+            gst_video_overlay_set_window_handle(GST_VIDEO_OVERLAY(videoSink), windowId);
+            gst_object_unref(videoSink);
+            pendingFlag = false;
+            qCDebug(log_gstreamer_videooverlaymanager) << "Deferred overlay setup completed successfully";
+            return true;
+        } else {
+            qCWarning(log_gstreamer_videooverlaymanager) << "Could not find video sink for deferred overlay setup";
+        }
+    } else {
+        qCWarning(log_gstreamer_videooverlaymanager) << "Still no valid window ID available for deferred overlay setup";
+    }
+
+    return false;
+}
