@@ -1,0 +1,222 @@
+name: Build DMG
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-latest
+    
+    steps:
+    - uses: actions/checkout@v3
+
+    # Detect whether this is a fork PR (secrets are unavailable for fork PRs)
+    - name: Set build context
+      id: context
+      run: |
+        if [[ "${{ github.event_name }}" == "pull_request" && \
+              "${{ github.event.pull_request.head.repo.full_name }}" != "${{ github.repository }}" ]]; then
+          echo "can_sign=false" >> $GITHUB_OUTPUT
+          echo "This is a fork PR — code signing will be skipped (secrets unavailable)."
+        else
+          echo "can_sign=true" >> $GITHUB_OUTPUT
+        fi
+    
+    # Install the Apple certificate and provisioning profile
+    - name: Install Apple Certificate
+      if: steps.context.outputs.can_sign == 'true'
+      env:
+        MACOS_CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+        MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+        KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+      run: |
+        set -euo pipefail
+
+        if [[ -z "${MACOS_CERTIFICATE_P12:-}" || -z "${MACOS_CERTIFICATE_PASSWORD:-}" || -z "${KEYCHAIN_PASSWORD:-}" ]]; then
+          echo "Missing signing secrets."
+          echo "Expected secrets: MACOS_CERTIFICATE_P12, MACOS_CERTIFICATE_PASSWORD, KEYCHAIN_PASSWORD"
+          echo "For pull_request from forks, GitHub does not expose repository secrets."
+          exit 1
+        fi
+
+        KEYCHAIN_PATH="$RUNNER_TEMP/build.keychain-db"
+
+        security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+        security list-keychains -d user -s "$KEYCHAIN_PATH" login.keychain-db
+        security default-keychain -d user -s "$KEYCHAIN_PATH"
+        security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+        # openssl handles multi-line / whitespace-padded base64 reliably on macOS runners.
+        printf '%s' "$MACOS_CERTIFICATE_P12" | tr -d '[:space:]' | openssl base64 -d -A > certificate.p12
+
+        if [[ ! -s certificate.p12 ]]; then
+          echo "ERROR: Decoded certificate.p12 is empty. Recheck MACOS_CERTIFICATE_P12 secret value."
+          exit 1
+        fi
+
+        echo "certificate.p12 size: $(wc -c < certificate.p12) bytes"
+
+        # Validate the p12 and confirm it contains a private key before importing.
+        echo "--- Validating p12 contents ---"
+        if ! openssl pkcs12 -info -in certificate.p12 -passin "pass:${MACOS_CERTIFICATE_PASSWORD}" -noout 2>&1; then
+          echo "ERROR: openssl could not parse certificate.p12."
+          echo "  - Check MACOS_CERTIFICATE_PASSWORD is correct."
+          echo "  - Re-export the .p12 from Keychain Access including the private key."
+          exit 1
+        fi
+
+        # Count private keys in the p12 (must be >= 1).
+        KEY_COUNT=$(openssl pkcs12 -in certificate.p12 -passin "pass:${MACOS_CERTIFICATE_PASSWORD}" -nodes -nocerts 2>/dev/null | grep -c "BEGIN PRIVATE KEY\|BEGIN RSA PRIVATE KEY\|BEGIN EC PRIVATE KEY" || true)
+        echo "Private keys found in p12: $KEY_COUNT"
+        if [[ "$KEY_COUNT" -eq 0 ]]; then
+          echo "ERROR: p12 contains no private key."
+          echo "  In Keychain Access, expand the certificate and right-click the CERTIFICATE+KEY pair, then export both."
+          exit 1
+        fi
+
+        security import certificate.p12 -k "$KEYCHAIN_PATH" -P "$MACOS_CERTIFICATE_PASSWORD" -f pkcs12 -T /usr/bin/codesign -T /usr/bin/security
+        security set-keychain-settings -lut 3600 "$KEYCHAIN_PATH"
+        security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+        security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+        echo "--- Identities in keychain ---"
+        security find-identity -v -p codesigning "$KEYCHAIN_PATH"
+    
+    # Resolve installed Xcode so the workflow survives runner image updates
+    # (macos-latest rolls forward; hardcoding Xcode_16.2.app broke in Aug 2026).
+    - name: Select Xcode
+      id: xcode
+      run: |
+        # Pick the newest Xcode .app in /Applications (matches GitHub runner convention).
+        XCODE_PATH="$(ls -d /Applications/Xcode_*.app 2>/dev/null | sort -V | tail -n 1)"
+        if [[ -z "$XCODE_PATH" ]]; then
+          echo "No Xcode found in /Applications — falling back to xcode-select -p"
+          XCODE_PATH="$(xcode-select -p | sed 's|/Contents/Developer||')"
+        fi
+        echo "Using Xcode at: $XCODE_PATH"
+        echo "DEVELOPER_DIR=$XCODE_PATH/Contents/Developer" >> "$GITHUB_ENV"
+
+    # Build the macOS app using xcodebuild (signed — non-fork only)
+    - name: Build macOS App
+      if: steps.context.outputs.can_sign == 'true'
+      env:
+        CODE_SIGN_IDENTITY: ${{ vars.CODE_SIGN_IDENTITY || 'Developer ID Application' }}
+        DEVELOPMENT_TEAM: ${{ vars.DEVELOPMENT_TEAM || 'NXWD68TXUQ' }}
+        CI_EXPORT_OPTIONS_PLIST: 'ciExportOptions.plist'
+      run: |
+        xcodebuild -scheme "openterface" \
+          -configuration Release \
+          -archivePath "build/Openterface.xcarchive" \
+          archive \
+          CODE_SIGN_IDENTITY="$CODE_SIGN_IDENTITY" \
+          CODE_SIGN_STYLE="Manual" \
+          DEVELOPMENT_TEAM="$DEVELOPMENT_TEAM"
+        # Create a new export options plist with values from GitHub Action variables since
+        # these parameters cannot be overwritten in the command line
+        echo "<?xml version=\"1.0\" encoding=\"UTF-8\"?>" > "$CI_EXPORT_OPTIONS_PLIST"
+        echo "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">" >> "$CI_EXPORT_OPTIONS_PLIST"
+        echo "<plist version=\"1.0\">" >> "$CI_EXPORT_OPTIONS_PLIST"
+        echo "<dict>" >> "$CI_EXPORT_OPTIONS_PLIST"
+        echo "    <key>method</key>" >> "$CI_EXPORT_OPTIONS_PLIST"
+        echo "    <string>developer-id</string>" >> "$CI_EXPORT_OPTIONS_PLIST"
+        echo "    <key>teamID</key>" >> "$CI_EXPORT_OPTIONS_PLIST"
+        echo "    <string>$DEVELOPMENT_TEAM</string>" >> "$CI_EXPORT_OPTIONS_PLIST"
+        echo "    <key>signingStyle</key>" >> "$CI_EXPORT_OPTIONS_PLIST"
+        echo "    <string>manual</string>" >> "$CI_EXPORT_OPTIONS_PLIST"
+        echo "    <key>signingCertificate</key>" >> "$CI_EXPORT_OPTIONS_PLIST"
+        echo "    <string>$CODE_SIGN_IDENTITY</string>" >> "$CI_EXPORT_OPTIONS_PLIST"
+        echo "</dict>" >> "$CI_EXPORT_OPTIONS_PLIST"
+        echo "</plist>" >> "$CI_EXPORT_OPTIONS_PLIST"
+        echo "--- Export options for CI ---"
+        cat "$CI_EXPORT_OPTIONS_PLIST"
+        echo "-----------------------------"
+        # Use the export options plist created above as the export options
+        # Leaves the original one in the repository untouched
+        xcodebuild -exportArchive \
+          -archivePath "build/Openterface.xcarchive" \
+          -exportPath "build/export" \
+          -exportOptionsPlist "$CI_EXPORT_OPTIONS_PLIST"
+    # Unsigned compilation check for fork PRs
+    - name: Build macOS App (unsigned — fork PR)
+      if: steps.context.outputs.can_sign == 'false'
+      run: |
+        xcodebuild -scheme "openterface" \
+          -configuration Release \
+          CODE_SIGN_IDENTITY="" \
+          CODE_SIGNING_REQUIRED=NO \
+          CODE_SIGNING_ALLOWED=NO \
+          build
+
+    # Notarize the app
+    - name: Notarize App
+      # main branch only, and only when signing secrets are available
+      if: github.ref == 'refs/heads/main' && steps.context.outputs.can_sign == 'true'
+      env:
+        APPLE_ID: ${{ secrets.APPLE_ID }}
+        APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+        DEVELOPMENT_TEAM: ${{ vars.DEVELOPMENT_TEAM || 'NXWD68TXUQ' }}
+      run: |
+        # Create temporary keychain
+        xcrun notarytool store-credentials "notarytool-profile" \
+          --apple-id "$APPLE_ID" \
+          --password "$APPLE_APP_SPECIFIC_PASSWORD" \
+          --team-id "$DEVELOPMENT_TEAM"
+        
+        # Zip the .app bundle for notarization
+        ditto -c -k --sequesterRsrc --keepParent "build/export/Openterface.app" "build/export/Openterface.zip"
+        
+        # Submit zipped app for notarization
+        xcrun notarytool submit "build/export/Openterface.zip" \
+          --keychain-profile "notarytool-profile" \
+          --wait
+        
+        # Staple the notarization ticket to the .app
+        xcrun stapler staple "build/export/Openterface.app"
+    # Create DMG using create-dmg
+    - name: Install create-dmg
+      if: steps.context.outputs.can_sign == 'true'
+      run: brew install create-dmg
+
+    - name: Create DMG
+      if: steps.context.outputs.can_sign == 'true'
+      run: |
+        create-dmg \
+          --volname "Openterface" \
+          --window-pos 200 120 \
+          --window-size 800 400 \
+          --icon-size 100 \
+          --icon "Openterface.app" 200 190 \
+          --hide-extension "Openterface.app" \
+          --app-drop-link 600 185 \
+          "build/Openterface.dmg" \
+          "build/export/Openterface.app"
+        xcrun notarytool submit "build/Openterface.dmg" --keychain-profile "notarytool-profile" --wait
+        xcrun stapler staple "build/Openterface.dmg"
+    # Upload DMG as artifact
+    - name: Upload DMG artifact
+      if: steps.context.outputs.can_sign == 'true'
+      uses: actions/upload-artifact@v4
+      with:
+        name: Openterface-KVM
+        path: build/*.dmg
+        retention-days: 30
+
+
+    - name: Cache node modules
+      uses: actions/cache@v3
+      with:
+        path: ~/.npm
+        key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+        restore-keys: |
+          ${{ runner.os }}-node- 
+    - name: Debug Certificates
+      if: steps.context.outputs.can_sign == 'true'
+      run: |
+        security find-identity -v -p codesigning
+        security list-keychains
+        security show-keychain-info "$RUNNER_TEMP/build.keychain-db"
