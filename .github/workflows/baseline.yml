@@ -1,0 +1,46 @@
+name: Baseline builds and tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: baseline-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  macos:
+    name: macOS build and deterministic tests
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out integration repository
+        uses: actions/checkout@v4
+
+      - name: Run deterministic macOS tests
+        run: make test-macos
+
+      - name: Build unsigned macOS application
+        run: make build-macos
+
+  qt-unit:
+    name: Qt standalone unit tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out integration repository
+        uses: actions/checkout@v4
+
+      - name: Install Qt unit-test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes cmake ninja-build qt6-base-dev
+
+      - name: Build and run Qt unit tests
+        run: make test-qt
