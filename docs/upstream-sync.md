@@ -14,6 +14,16 @@ official upstream commit is already integrated.
 The standalone forks remain the preferred place to prepare narrowly scoped
 changes intended for either official repository.
 
+## Merge policy
+
+Pull requests containing an initial subtree import or a subtree synchronization
+merge must reach the integration branch with **Create a merge commit**. Do not
+squash-merge or rebase those PRs: doing so can discard the source parent
+ancestry used by drift detection, future subtree pulls, and clean exports.
+
+Ordinary feature and documentation pull requests that do not contain subtree
+merge commits may follow the project's normal merge policy.
+
 ## Configure and check
 
 ```sh
