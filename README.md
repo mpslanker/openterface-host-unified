@@ -46,6 +46,23 @@ Or use the convenience target:
 make check-upstreams
 ```
 
+List the available baseline build and test commands with:
+
+```sh
+make help
+```
+
+The initial safety-net commands are:
+
+```sh
+make build-macos
+make test-macos
+make test-qt
+```
+
+See [Baseline builds and tests](docs/baseline-testing.md) for prerequisites,
+scope, and the intentionally excluded hardware-dependent tests.
+
 The two applications retain their original build systems and documentation:
 
 - macOS: `apps/macos/README.md`
