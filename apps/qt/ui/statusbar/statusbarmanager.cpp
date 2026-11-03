@@ -1,0 +1,321 @@
+#include "statusbarmanager.h"
+#include <QPainter>
+#include <QLoggingCategory>
+#include <QSvgRenderer>
+#include <QTimer>
+#include "log/opflogging.h"
+
+OPF_LOGGING_CATEGORY(log_ui_statusbarmanager, "opf.ui.statusbarmanager")
+StatusBarManager::StatusBarManager(QStatusBar *statusBar, QObject *parent)
+    : QObject(parent), m_statusBar(statusBar), m_messageTimer(new QTimer(this)), m_messageThrottleActive(false)
+{
+    iconColor = QPalette().color(QPalette::WindowText);
+    m_statusWidget = new StatusWidget(m_statusBar);
+    m_statusBar->addPermanentWidget(m_statusWidget);
+    
+    // Setup message timer for throttling
+    m_messageTimer->setSingleShot(true);
+    connect(m_messageTimer, &QTimer::timeout, this, [this]() {
+        m_messageThrottleActive = false;
+        if (!m_pendingMessage.isEmpty()) {
+            // Show the pending message if there's one waiting
+            statusMessageLabel->setText(m_pendingMessage);
+            m_lastMessage = m_pendingMessage;
+            m_pendingMessage.clear();
+        }
+    });
+    
+    initStatusBar();
+}
+
+void StatusBarManager::initStatusBar()
+{
+    mouseLabel = new QLabel(m_statusBar);
+    mouseLocationLabel = new QLabel(QString("(0,0)"), m_statusBar);
+    mouseLocationLabel->setFixedWidth(80);
+
+    QWidget *mouseContainer = new QWidget(m_statusBar);
+    QHBoxLayout *mouseLayout = new QHBoxLayout(mouseContainer);
+
+    mouseLayout->setContentsMargins(0, 0, 0, 0);
+    mouseLayout->addWidget(mouseLabel);
+    mouseLayout->addWidget(mouseLocationLabel);
+    m_statusBar->addWidget(mouseContainer);
+
+    keyPressedLabel = new QLabel(m_statusBar);
+    keyLabel = new QLabel(m_statusBar);
+    keyLabel->setFixedWidth(120);
+
+    QWidget *keyContainer = new QWidget(m_statusBar);
+    QHBoxLayout *keyLayout = new QHBoxLayout(keyContainer);
+    keyLayout->setContentsMargins(0, 0, 0, 0);
+    keyLayout->addWidget(keyPressedLabel);
+    keyLayout->addWidget(keyLabel);
+    m_statusBar->addWidget(keyContainer);
+
+    // TCP Server keys display - hidden by default, shown when TCP server starts
+    tcpKeyLabel = new QLabel(m_statusBar);
+    tcpKeyLabel->setFixedWidth(150);
+    tcpKeyLabel->setText("TCP: -");
+    tcpKeyLabel->setStyleSheet("color: #0066cc;");
+    tcpKeyLabel->hide();
+    m_statusBar->addWidget(tcpKeyLabel);
+
+    QWidget *statusMessageContainer = new QWidget(m_statusBar);
+    QHBoxLayout *statusMessageLayout = new QHBoxLayout(statusMessageContainer);
+    statusMessageLabel = new QLabel(m_statusBar);
+
+    statusMessageLayout->addWidget(statusMessageLabel);
+    m_statusBar->addWidget(statusMessageContainer);
+
+    onLastKeyPressed("");
+    updateIconColor();
+}
+
+void StatusBarManager::factoryReset(bool isStarted)
+{
+    if (isStarted) {
+        statusMessageLabel->setText("Factory Reset Started, it may take a few seconds...");
+        statusMessageLabel->setStyleSheet("color: red;");
+    }else {
+        statusMessageLabel->clear();
+        statusMessageLabel->setText("Factory Reset Ended");
+        statusMessageLabel->setStyleSheet("color: green;");
+    }
+}
+
+void StatusBarManager::serialPortReset(bool isStarted)
+{
+    if (isStarted) {
+        statusMessageLabel->clear();
+        statusMessageLabel->setText("Serial Port Reset Started");
+        statusMessageLabel->setStyleSheet("color: red;");
+    }else {
+        statusMessageLabel->clear();
+        statusMessageLabel->setText("Serial Port Reset Ended");
+        statusMessageLabel->setStyleSheet("color: green;");
+        QTimer::singleShot(1000, statusMessageLabel, &QLabel::clear);
+    }
+}
+
+void StatusBarManager::showThrottledMessage(const QString& message, const QString& style, int duration)
+{
+    if (m_messageThrottleActive && m_lastMessage == message) {
+        // Same message is already being displayed, ignore
+        return;
+    }
+    
+    if (m_messageThrottleActive) {
+        // Store as pending message to show later
+        m_pendingMessage = message;
+        return;
+    }
+    
+    // Show the message immediately
+    statusMessageLabel->clear();
+    statusMessageLabel->setText(message);
+    statusMessageLabel->setStyleSheet(style);
+    m_lastMessage = message;
+    m_messageThrottleActive = true;
+    
+    // Clear after duration and allow new messages
+    QTimer::singleShot(duration, this, [this]() {
+        statusMessageLabel->clear();
+        m_messageThrottleActive = false;
+        m_lastMessage.clear();
+    });
+}
+
+void StatusBarManager::showNewDevicePluggedIn(const QString& portChain)
+{
+    qCDebug(log_ui_statusbarmanager) << "StatusBarManager::showNewDevicePluggedIn called with portChain:" << portChain;
+    if (!portChain.isEmpty()) {
+        QString message = QString("New device detected: Port %1").arg(portChain);
+        showThrottledMessage(message, "color: blue;", 3000);
+    }
+}
+
+void StatusBarManager::showDeviceUnplugged(const QString& portChain)
+{
+    qCDebug(log_ui_statusbarmanager) << "StatusBarManager::showDeviceUnplugged called with portChain:" << portChain;
+    if (!portChain.isEmpty()) {
+        QString message = QString("Device unplugged: Port %1").arg(portChain);
+        showThrottledMessage(message, "color: orange;", 3000);
+    }
+}
+
+void StatusBarManager::onLastKeyPressed(const QString& key)
+{
+    updateKeyboardIcon(key);
+    if (m_hideKeyboardInput && !key.isEmpty()) {
+        keyLabel->setText(QString(1, QChar(0x2022)));
+    } else {
+        keyLabel->setText(key);
+    }
+}
+
+void StatusBarManager::onTcpServerKeyHandled(const QString& key)
+{
+    if (!key.isEmpty()) {
+        tcpKeyLabel->setText(QString("TCP: %1").arg(key));
+        tcpKeyLabel->setStyleSheet("color: #0066cc; font-weight: bold;");
+    } else {
+        tcpKeyLabel->setText("TCP: -");
+        tcpKeyLabel->setStyleSheet("color: #0066cc;");
+    }
+}
+
+void StatusBarManager::setTcpServerVisible(bool visible)
+{
+    tcpKeyLabel->setVisible(visible);
+}
+
+void StatusBarManager::onLastMouseLocation(const QPoint& location, const QString& mouseEvent)
+{
+    QString svgPath;
+    if (mouseEvent == "L") {
+        svgPath = ":/images/mouse-left-button.svg";
+    } else if (mouseEvent == "R") {
+        svgPath = ":/images/mouse-right-button.svg";
+    } else if (mouseEvent == "M") {
+        svgPath = ":/images/mouse-middle-button.svg";
+    } else {
+        svgPath = ":/images/mouse-default.svg";
+    }
+
+    QPixmap pixmap = recolorSvg(svgPath, iconColor, QSize(12, 12));
+    mouseLabel->setPixmap(pixmap);
+
+    int mouse_x = location.x();
+    int mouse_y = location.y();
+
+    mouseLocationLabel->setText(QString("(%1,%2)").arg(mouse_x).arg(mouse_y));
+}
+
+void StatusBarManager::setConnectedPort(const QString& port, const int& baudrate)
+{
+    m_currentPort = port;
+    m_statusWidget->setConnectedPort(port, baudrate);
+}
+
+void StatusBarManager::setStatusUpdate(const QString& status)
+{
+    m_statusWidget->setStatusUpdate(status);
+}
+
+void StatusBarManager::setInputResolution(int width, int height, float fps, float pixelClk)
+{
+    m_statusWidget->setInputResolution(width, height, fps, pixelClk);
+}
+
+void StatusBarManager::setCaptureResolution(int width, int height, int fps)
+{
+    m_statusWidget->setCaptureResolution(width, height, fps);
+}
+
+void StatusBarManager::setFps(double fps)
+{
+    QString backend = GlobalSetting::instance().getMediaBackend();
+    m_statusWidget->setFps(fps, backend);
+}
+
+QPixmap StatusBarManager::recolorSvg(const QString &svgPath, const QColor &color, const QSize &size)
+{
+    QSvgRenderer svgRenderer(svgPath);
+    QPixmap pixmap(size);
+    pixmap.fill(Qt::transparent);
+    QPainter painter(&pixmap);
+    svgRenderer.render(&painter);
+
+    QPixmap colorOverlay(size);
+    colorOverlay.fill(color);
+
+    painter.setCompositionMode(QPainter::CompositionMode_SourceIn);
+    painter.drawPixmap(0, 0, colorOverlay);
+
+    return pixmap;
+}
+
+QColor StatusBarManager::getContrastingColor(const QColor &color)
+{
+    double luminance = (0.299 * color.red() + 0.587 * color.green() + 0.114 * color.blue()) / 255;
+    return luminance > 0.5 ? QColor(0, 0, 0) : QColor(255, 255, 255);
+}
+
+void StatusBarManager::setTargetUsbConnected(bool isConnected)
+{
+    qCDebug(log_ui_statusbarmanager) << "StatusBarManager::setTargetUsbConnected - Target USB connection status:" << (isConnected ? "Connected" : "Disconnected");
+    m_statusWidget->setTargetUsbConnected(isConnected);
+}
+
+void StatusBarManager::updateIconColor()
+{
+    iconColor = getContrastingColor(m_statusBar->palette().color(QPalette::Window));
+    updateKeyboardIcon(keyLabel->text());
+    onLastMouseLocation(QPoint(0, 0), "");
+}
+
+void StatusBarManager::showCameraSwitching(const QString& fromDevice, const QString& toDevice)
+{
+    QString message = QString("📹 Switching camera: %1 → %2").arg(fromDevice.isEmpty() ? "None" : fromDevice, toDevice);
+    showThrottledMessage(message, "color: purple;", 2000);
+}
+
+void StatusBarManager::showCameraSwitchComplete(const QString& device)
+{
+    QString message = QString("✅ Camera ready: %1").arg(device);
+    showThrottledMessage(message, "color: green;", 2000);
+}
+
+void StatusBarManager::updateKeyboardIcon(const QString& key)
+{
+    QString svgPath = key.isEmpty() ? ":/images/keyboard.svg" : ":/images/keyboard-pressed.svg";
+    QPixmap pixmap = recolorSvg(svgPath, iconColor, QSize(18, 18));
+    keyPressedLabel->setPixmap(pixmap);
+}
+
+void StatusBarManager::setKeyStates(bool numLock, bool capsLock, bool scrollLock)
+{
+    if (!m_statusWidget) {
+        qCritical() << "CRITICAL: StatusBarManager::setKeyStates - m_statusWidget is null!";
+        return;
+    }
+    
+    m_statusWidget->setKeyStates(numLock, capsLock, scrollLock);
+}
+
+void StatusBarManager::showSerialAutoRestart(int attemptNumber, int maxAttempts, double lossRate)
+{
+    QString message = QString("⚠️ Auto-restarting serial port (attempt %1/%2) - Loss rate: %3%")
+                      .arg(attemptNumber)
+                      .arg(maxAttempts)
+                      .arg(QString::number(lossRate * 100.0, 'f', 1));
+    showThrottledMessage(message, "color: orange;", 3000);
+}
+
+void StatusBarManager::setRecordingTime(const QString& time)
+{
+    if (m_statusWidget) {
+        m_statusWidget->setRecordingTime(time);
+    }
+}
+
+void StatusBarManager::showRecordingIndicator(bool show)
+{
+    if (m_statusWidget) {
+        m_statusWidget->showRecordingTime(show);
+    }
+}
+
+void StatusBarManager::setHideKeyboardInput(bool hide)
+{
+    m_hideKeyboardInput = hide;
+    if (hide) {
+        QString currentKey = keyLabel->text();
+        if (!currentKey.isEmpty()) {
+            keyLabel->setText(QString(1, QChar(0x2022)));
+        }
+    } else {
+        keyLabel->setText("");
+    }
+}

@@ -1,0 +1,467 @@
+import SwiftUI
+
+// A short platform label (e.g. "Win", "Linux") in a rounded-rectangle border.
+private struct TargetOSLogoView: View {
+    let system: ChatTargetSystem
+    var size: CGFloat = 16
+
+    private var label: String {
+        switch system {
+        case .macOS:   return "Mac"
+        case .windows: return "Win"
+        case .linux:   return "Linux"
+        case .iPhone:  return "iOS"
+        case .iPad:    return "iPadOS"
+        case .android: return "Android"
+        }
+    }
+
+    var body: some View {
+        Text(label)
+            .font(.system(size: size * 0.55, weight: .semibold, design: .rounded))
+            .lineLimit(1)
+            .minimumScaleFactor(0.6)
+            .padding(.horizontal, size * 0.25)
+            .padding(.vertical,   size * 0.1)
+            .overlay(
+                RoundedRectangle(cornerRadius: size * 0.3)
+                    .stroke(Color.primary.opacity(0.55), lineWidth: 1)
+            )
+            .accessibilityLabel(system.displayName)
+    }
+}
+
+
+struct ToolbarContentView: ToolbarContent {
+    // Bindings and values provided by the parent App
+    @Binding var showButtons: Bool
+    @Binding var switchToTarget: Bool
+
+    var isAudioEnabled: Bool
+    var canTakePicture: Bool
+    var canRecordVideo: Bool
+    var isRecording: Bool
+    var hasHdmiSignal: Bool?
+    var isKeyboardConnected: Bool?
+    var isMouseConnected: Bool?
+    var isMouseLoopRunning: Bool
+
+    var resolutionWidth: String
+    var resolutionHeight: String
+    var fps: String
+    var pixelClock: String
+
+    var serialPortName: String
+    @Binding var serialPortBaudRate: Int
+
+
+    // observe the shared serial manager directly so we track configuration state
+    @ObservedObject private var concreteSerialPortMgr: SerialPortManager = SerialPortManager.shared
+    @ObservedObject private var serialPortStatus: SerialPortStatus = .shared
+    @ObservedObject private var userSettings: UserSettings = .shared
+
+    // Action callbacks
+    var handleSwitchToggle: (Bool) -> Void
+    var toggleAudio: (Bool) -> Void
+    var showAspectRatioSelection: () -> Void
+    var showUSBDevices: () -> Void
+
+    // popover state for baud menu
+    @State private var showBaudPopover = false
+
+    // popover state for macro panel
+    @State private var showMacrosPopover = false
+
+    // hover state for each selection button
+    @State private var hovering9600 = false
+    @State private var hovering115200 = false
+    @State private var isAwaitingControlChipsetReady = false
+
+    // Resolve dependencies directly when needed
+    private var floatingKeyboardManager: FloatingKeyboardManagerProtocol { DependencyContainer.shared.resolve(FloatingKeyboardManagerProtocol.self) }
+    private var audioManager: AudioManagerProtocol { DependencyContainer.shared.resolve(AudioManagerProtocol.self) }
+    private var cameraManager: CameraManagerProtocol { DependencyContainer.shared.resolve(CameraManagerProtocol.self) }
+    private var serialPortManager: SerialPortManagerProtocol { DependencyContainer.shared.resolve(SerialPortManagerProtocol.self) }
+    private var mouseManager: MouseManagerProtocol { DependencyContainer.shared.resolve(MouseManagerProtocol.self) }
+    private var chatWindowManager: ChatWindowManagerProtocol { DependencyContainer.shared.resolve(ChatWindowManagerProtocol.self) }
+    private var logger: LoggerProtocol { DependencyContainer.shared.resolve(LoggerProtocol.self) }
+    private var shouldShowHardwareToggle: Bool { UserSettings.shared.connectionProtocolMode == .kvm }
+    private var isShowingBaudrateTransition: Bool { isAwaitingControlChipsetReady }
+
+    var body: some ToolbarContent {
+        ToolbarItemGroup(placement: .automatic) {
+            Button {
+                logger.log(content: "🎹 Floating keyboard button pressed")
+                floatingKeyboardManager.showFloatingKeysWindow()
+            } label: {
+                Image(systemName: showButtons ? "keyboard" : "keyboard.chevron.compact.down.fill")
+            }
+
+            Button {
+                chatWindowManager.toggleChatWindow()
+            } label: {
+                Image(systemName: UserSettings.shared.isChatWindowVisible ? "bubble.left.and.bubble.right.fill" : "bubble.left.and.bubble.right")
+            }
+            .help(UserSettings.shared.isChatWindowVisible ? "Hide companion chat" : "Show companion chat")
+
+            Button {
+                showMacrosPopover.toggle()
+            } label: {
+                Image(systemName: "keyboard.badge.ellipsis")
+            }
+            .help("Keyboard Macros")
+            .popover(isPresented: $showMacrosPopover) {
+                MacroPanelView()
+            }
+
+            LockIndicatorsView()
+
+            Button(action: {}) {
+                Image(systemName: "poweron") // spacer
+            }
+            .disabled(true)
+            .buttonStyle(PlainButtonStyle())
+
+            Menu {
+                Button(action: {
+                    toggleAudio(!isAudioEnabled)
+                }) {
+                    Label(isAudioEnabled ? "Mute Audio" : "Unmute Audio",
+                          systemImage: isAudioEnabled ? "speaker.slash" : "speaker.wave.3")
+                }
+
+                Divider()
+
+                Menu("Audio Settings") {
+                    AudioSourceMenuContent(audioManager: audioManager as! AudioManager)
+                }
+            } label: {
+                Image(systemName: isAudioEnabled ? "speaker.wave.3.fill" : "speaker.slash.fill")
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+                    .frame(width: 16, height: 16)
+                    .foregroundColor(isAudioEnabled ? .green : .red)
+            }
+
+            Button {
+                cameraManager.takePicture()
+            } label: {
+                Image(systemName: "camera.fill")
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+                    .frame(width: 16, height: 16)
+                    .foregroundColor(canTakePicture ? .blue : .gray)
+            }
+            .help("Take Picture")
+            .disabled(!canTakePicture)
+
+            Button {
+                if isRecording {
+                    cameraManager.stopVideoRecording()
+                } else {
+                    cameraManager.startVideoRecording()
+                }
+            } label: {
+                Image(systemName: isRecording ? "record.circle.fill" : "record.circle")
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+                    .frame(width: 16, height: 16)
+                    .foregroundColor(isRecording ? .red : (canRecordVideo ? .blue : .gray))
+            }
+            .help(canRecordVideo || isRecording ? (isRecording ? "Stop Recording" : "Start Video Recording") : "Video recording is unavailable until a live frame is available")
+            .disabled(!canRecordVideo && !isRecording)
+
+            Button(action: {
+                showAspectRatioSelection()
+            }) {
+                Image(systemName: "display")
+                    .resizable()
+                    .frame(width: 14, height: 14)
+                    .foregroundColor(colorForConnectionStatus(hasHdmiSignal))
+            }
+            .help("Click to view Target Aspect Ratio...")
+        }
+
+        ToolbarItem(placement: .automatic) {
+            Menu {
+                ForEach(ChatTargetSystem.allCases) { system in
+                    Button {
+                        userSettings.chatTargetSystem = system
+                        // Auto-switch keyboard layout to match the target OS.
+                        switch system {
+                        case .windows:
+                            userSettings.keyboardLayout = .windows
+                        case .linux:
+                            userSettings.keyboardLayout = .linux
+                        case .macOS, .iPhone, .iPad, .android:
+                            userSettings.keyboardLayout = .mac
+                        }
+                    } label: {
+                        HStack(spacing: 6) {
+                            TargetOSLogoView(system: system)
+                            Text(system.displayName)
+                            if system == userSettings.chatTargetSystem {
+                                Text("✓")
+                                    .font(.system(size: 9, weight: .semibold))
+                                    .foregroundColor(.secondary)
+                            }
+                        }
+                    }
+                }
+            } label: {
+                TargetOSLogoView(system: userSettings.chatTargetSystem)
+            }
+            .help("Target OS: \(userSettings.chatTargetSystem.displayName)")
+        }
+
+        ToolbarItem(placement: .primaryAction) {
+            let connectionMode = UserSettings.shared.connectionProtocolMode
+            ResolutionView(
+                width: resolutionWidth,
+                height: resolutionHeight,
+                fps: fps,
+                helpText: connectionMode == .kvm
+                    ? "Input Resolution: \(resolutionWidth)x\(resolutionHeight)\n" +
+                        "Capture Resolution: \(Int(AppStatus.videoDimensions.width))x\(Int(AppStatus.videoDimensions.height))\n" +
+                        "Refresh Rate: \(fps) Hz\n" +
+                        "Pixel Clock: \(pixelClock) MHz\n" +
+                        "HTotal: \(AppStatus.hidInputHTotal)\n" +
+                        "VTotal: \(AppStatus.hidInputVTotal)\n" +
+                        "Hst: \(AppStatus.hidInputHst)\n" +
+                        "Vst: \(AppStatus.hidInputVst)\n" +
+                        "Hsync Width: \(AppStatus.hidInputHsyncWidth)\n" +
+                        "Vsync Width: \(AppStatus.hidInputVsyncWidth)"
+                    : "Remote Resolution: \(resolutionWidth)x\(resolutionHeight)\n" +
+                        "Remote Refresh Rate: \(fps) Hz\n" +
+                        "Compression: \(AppStatus.remoteCompressionLabel.isEmpty ? "Unknown" : AppStatus.remoteCompressionLabel)\n" +
+                        String(format: "Remote Bandwidth: %.2f MB/s", AppStatus.remoteBandwidthMBps)
+            )
+        }
+
+        ToolbarItem(placement: .automatic) {
+            if shouldShowHardwareToggle {
+                Button(action: {
+                    showUSBDevices()
+                }) {
+                    HStack {
+                        if isShowingBaudrateTransition {
+                            ProgressView()
+                                .controlSize(.small)
+                                .frame(width: 16, height: 12)
+                            ProgressView()
+                                .controlSize(.small)
+                                .frame(width: 14, height: 12)
+                        } else {
+                            Image(systemName: "keyboard.fill")
+                                .resizable()
+                                .frame(width: 16, height: 12)
+                                .foregroundColor(colorForConnectionStatus(isKeyboardConnected))
+                            Image(systemName: isMouseLoopRunning ? "cursor.rays" : "computermouse.fill")
+                                .resizable()
+                                .frame(width: isMouseLoopRunning ? 14 : 10, height: 12)
+                                .foregroundColor(colorForConnectionStatus(isMouseConnected))
+                        }
+                    }
+                }
+                .onChange(of: serialPortStatus.isControlChipsetReady) { isReady in
+                    if isAwaitingControlChipsetReady && isReady {
+                        isAwaitingControlChipsetReady = false
+                    }
+                }
+                .help(
+                    isShowingBaudrateTransition
+                    ? """
+                    Updating serial baudrate...
+
+                    Keyboard and mouse will reconnect automatically when the control chipset is ready.
+                    """
+                    : """
+                    KeyBoard: \(
+                        isKeyboardConnected == true ? "Connected" :
+                        isKeyboardConnected == false ? "Not found" : "Unknown"
+                    )
+                    Mouse: \(
+                        isMouseConnected == true ? "Connected" :
+                        isMouseConnected == false ? "Not found" : "Unknown"
+                    )
+
+                    Click to view USB device details
+                    """
+                )
+            }
+        }
+
+        ToolbarItem(placement: .automatic) {
+            // use the shared manager we’re observing
+            let serialPortMgr = concreteSerialPortMgr
+            let connectionMode = UserSettings.shared.connectionProtocolMode
+
+            // determine display values directly from bindings
+            let displayName = serialPortName
+            let displayBaud = serialPortBaudRate
+
+            if connectionMode == .kvm {
+                Button {
+                    showBaudPopover = true
+                } label: {
+                    SerialInfoView(portName: displayName,
+                                   baudRate: displayBaud,
+                                   processingHz: UserSettings.shared.mouseEventThrottleHz)
+                        .frame(width: 140, alignment: .leading)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .buttonStyle(PlainButtonStyle())
+                .popover(isPresented: $showBaudPopover) {
+                        VStack(spacing: 8) {
+                            Button("9600 bps") {
+                                logger.log(content: "Serial baudrate popover: user chose 9600")
+                                isAwaitingControlChipsetReady = true
+                                serialPortMgr.resetDeviceToBaudrate(9600)
+                                showBaudPopover = false
+                            }
+                            .onHover { hovering9600 = $0 }
+                            .shadow(color: .black.opacity(hovering9600 ? 0.25 : 0), radius: hovering9600 ? 8 : 0, x: 0, y: 2)
+
+                            Button("115200 bps") {
+                                logger.log(content: "Serial baudrate popover: user chose 115200")
+                                isAwaitingControlChipsetReady = true
+                                serialPortMgr.resetDeviceToBaudrate(115200)
+                                showBaudPopover = false
+                            }
+                            .onHover { hovering115200 = $0 }
+                            .shadow(color: .black.opacity(hovering115200 ? 0.25 : 0), radius: hovering115200 ? 8 : 0, x: 0, y: 2)
+                        }
+                        .padding(8)
+                    }
+                    .disabled(serialPortMgr.isConfiguring)
+            } else {
+                RemoteInfoView(protocolMode: connectionMode)
+                    .frame(width: 190, alignment: .leading)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+
+        ToolbarItem(placement: .automatic) {
+            if shouldShowHardwareToggle {
+                Button(action: {}) {
+                    Image(systemName: "poweron") // spacer
+                }
+                .disabled(true)
+                .buttonStyle(PlainButtonStyle())
+            }
+        }
+
+        ToolbarItemGroup(placement: .automatic) {
+            if shouldShowHardwareToggle {
+                Toggle(isOn: $switchToTarget) {
+                    HStack {
+                        Image(switchToTarget ? "Target_icon" : "Host_icon")
+                            .resizable()
+                            .aspectRatio(contentMode: .fit)
+                            .frame(width: 20, height: 15)
+                        Text(switchToTarget ? "Target" : "Host")
+                    }
+                }
+                .toggleStyle(SwitchToggleStyle(width: 30, height: 16))
+                .onChange(of: switchToTarget) { newValue in
+                    handleSwitchToggle(newValue)
+                }
+            }
+        }
+    }
+
+    func colorForConnectionStatus(_ isConnected: Bool?) -> Color {
+        switch isConnected {
+        case .some(true):
+            return Color(red: 124 / 255.0, green: 205 / 255.0, blue: 124 / 255.0)
+        case .some(false):
+            return .orange
+        case .none:
+            return .gray
+        }
+    }
+}
+
+// MARK: - ViewModifier wrapper
+// Using a ViewModifier gives the compiler a concrete type context so it can
+// unambiguously pick the ToolbarContent-based toolbar(content:) overload.
+struct AppToolbarModifier: ViewModifier {
+    @Binding var showButtons: Bool
+    @Binding var switchToTarget: Bool
+    var isAudioEnabled: Bool
+    var canTakePicture: Bool
+    var canRecordVideo: Bool
+    var isRecording: Bool
+    var hasHdmiSignal: Bool?
+    var isKeyboardConnected: Bool?
+    var isMouseConnected: Bool?
+    var isMouseLoopRunning: Bool
+    var resolutionWidth: String
+    var resolutionHeight: String
+    var fps: String
+    var pixelClock: String
+    var serialPortName: String
+    @Binding var serialPortBaudRate: Int
+    var handleSwitchToggle: (Bool) -> Void
+    var toggleAudio: (Bool) -> Void
+    var showAspectRatioSelection: () -> Void
+    var showUSBDevices: () -> Void
+
+    func body(content: Content) -> some View {
+        content.toolbar {
+            ToolbarContentView(
+                showButtons: $showButtons,
+                switchToTarget: $switchToTarget,
+                isAudioEnabled: isAudioEnabled,
+                canTakePicture: canTakePicture,
+                canRecordVideo: canRecordVideo,
+                isRecording: isRecording,
+                hasHdmiSignal: hasHdmiSignal,
+                isKeyboardConnected: isKeyboardConnected,
+                isMouseConnected: isMouseConnected,
+                isMouseLoopRunning: isMouseLoopRunning,
+                resolutionWidth: resolutionWidth,
+                resolutionHeight: resolutionHeight,
+                fps: fps,
+                pixelClock: pixelClock,
+                serialPortName: serialPortName,
+                serialPortBaudRate: $serialPortBaudRate,
+                handleSwitchToggle: handleSwitchToggle,
+                toggleAudio: toggleAudio,
+                showAspectRatioSelection: showAspectRatioSelection,
+                showUSBDevices: showUSBDevices
+            )
+        }
+    }
+}
+
+struct ToolbarContentView_Previews: PreviewProvider {
+    static var previews: some View {
+        // Wrap the ToolbarContent in a real View for previews
+        EmptyView()
+            .toolbar {
+                ToolbarContentView(
+                    showButtons: .constant(false),
+                    switchToTarget: .constant(false),
+                    isAudioEnabled: true,
+                    canTakePicture: false,
+                    canRecordVideo: false,
+                    isRecording: false,
+                    hasHdmiSignal: nil,
+                    isKeyboardConnected: nil,
+                    isMouseConnected: nil,
+                    isMouseLoopRunning: false,
+                    resolutionWidth: "-",
+                    resolutionHeight: "-",
+                    fps: "-",
+                    pixelClock: "0.00",
+                    serialPortName: "N/A",
+                    serialPortBaudRate: .constant(0),
+                    handleSwitchToggle: { _ in },
+                    toggleAudio: { _ in },
+                    showAspectRatioSelection: {},
+                    showUSBDevices: {}
+                )
+            }
+    }
+}

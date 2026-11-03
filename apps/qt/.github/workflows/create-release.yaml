@@ -1,0 +1,487 @@
+name: Create GitHub Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      draft:
+        description: 'Create a draft release'
+        required: false
+        type: boolean
+        default: true
+      prerelease:
+        description: 'Tag this release as a pre-release'
+        required: false
+        type: boolean
+        default: false
+      skip_windows_signing:
+        description: 'Skip Windows app signing (use unsigned builds)'
+        required: false
+        type: boolean
+        default: false
+      sign_amd64_installer:
+        description: 'Sign AMD64 installer'
+        required: false
+        type: boolean
+        default: true
+      sign_amd64_portable:
+        description: 'Sign AMD64 portable'
+        required: false
+        type: boolean
+        default: true
+      sign_arm64_installer:
+        description: 'Sign ARM64 installer'
+        required: false
+        type: boolean
+        default: true
+      sign_arm64_portable:
+        description: 'Sign ARM64 portable'
+        required: false
+        type: boolean
+        default: true
+
+jobs:
+  wait-for-builds:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Wait for required workflows
+        run: |
+          # Fixed list of workflows to wait for
+          WORKFLOWS=("windows-build.yaml" "windows-portable-build.yaml" "windows-arm64-build.yaml" "linux-build.yaml")
+          
+          echo "Workflows to wait for:"
+          for workflow in "${WORKFLOWS[@]}"; do
+            echo "- $workflow"
+            
+            echo "Waiting for workflow: $workflow"
+            
+            # Wait for the workflow to complete
+            echo "Looking for recent runs of $workflow on branch ${{ github.ref_name }}..."
+            run_id=$(gh run list --workflow=$workflow --branch=${{ github.ref_name }} --limit=1 --json databaseId --jq '.[0].databaseId')
+            
+            if [ -n "$run_id" ]; then
+              echo "Found run ID: $run_id. Waiting for completion..."
+              gh run watch $run_id
+            else
+              echo "Warning: No recent runs found for $workflow on branch ${{ github.ref_name }}"
+            fi
+          done
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  
+  # -----------------------------------------------------------------------
+  # Parallel signing jobs
+  # -----------------------------------------------------------------------
+
+  sign-amd64-installer:
+    needs: wait-for-builds
+    runs-on: windows-latest
+    if: ${{ !inputs.skip_windows_signing && inputs.sign_amd64_installer }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      - name: Download Windows AMD64 installer artifact
+        uses: dawidd6/action-download-artifact@v2
+        with:
+          workflow: windows-build.yaml
+          workflow_conclusion: success
+          name: openterfaceQT_windows_amd64_installer
+          path: artifacts/windows
+
+      - name: Upload AMD64 installer artifact for signing
+        id: upload-installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: openterfaceQT.windows.amd.installer.unsigned
+          path: artifacts/windows
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Submit AMD64 installer signing request
+        uses: signpath/github-action-submit-signing-request@v1.2
+        with:
+          api-token: ${{ secrets.CI_TOKEN }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: Openterface_QT
+          signing-policy-slug: release-signing
+          artifact-configuration-slug: Openterface_Connect_win_installer_zip
+          github-artifact-id: ${{ steps.upload-installer.outputs.artifact-id }}
+          wait-for-completion: true
+          output-artifact-directory: artifacts/windows/signed
+
+      - name: Upload signed AMD64 installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: openterfaceQT_windows_amd64_installer_signed
+          path: artifacts/windows/signed/openterfaceQT.windows.amd64.installer.exe
+          retention-days: 7
+
+  sign-amd64-portable:
+    needs: wait-for-builds
+    runs-on: windows-latest
+    if: ${{ !inputs.skip_windows_signing && inputs.sign_amd64_portable }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      - name: Download Windows AMD64 portable artifact
+        uses: dawidd6/action-download-artifact@v2
+        with:
+          workflow: windows-portable-build.yaml
+          workflow_conclusion: success
+          name: openterfaceQT-portable.exe
+          path: artifacts/windows/portable
+
+      - name: Upload AMD64 portable artifact for signing
+        id: upload-portable
+        uses: actions/upload-artifact@v4
+        with:
+          name: openterfaceQT.windows.amd.portable.unsigned.exe
+          path: artifacts/windows/portable
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Submit AMD64 portable signing request
+        uses: signpath/github-action-submit-signing-request@v1.2
+        with:
+          api-token: ${{ secrets.CI_TOKEN }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: Openterface_QT
+          signing-policy-slug: release-signing
+          artifact-configuration-slug: Openterface_Connect_window_portable
+          github-artifact-id: ${{ steps.upload-portable.outputs.artifact-id }}
+          wait-for-completion: true
+          output-artifact-directory: artifacts/windows/signed
+
+      - name: Upload signed AMD64 portable
+        uses: actions/upload-artifact@v4
+        with:
+          name: openterfaceQT_windows_amd64_portable_signed
+          path: artifacts/windows/signed/openterfaceQT-portable.exe
+          retention-days: 7
+
+  sign-arm64-installer:
+    needs: wait-for-builds
+    runs-on: windows-latest
+    if: ${{ !inputs.skip_windows_signing && inputs.sign_arm64_installer }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      - name: Download Windows ARM64 installer artifact
+        uses: dawidd6/action-download-artifact@v2
+        with:
+          workflow: windows-arm64-build.yaml
+          workflow_conclusion: success
+          name: openterfaceQT_windows_arm64_installer
+          path: artifacts/windows/arm64
+
+      - name: Upload ARM64 installer artifact for signing
+        id: upload-arm64-installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: openterfaceQT.windows.arm64.installer.unsigned
+          path: artifacts/windows/arm64
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Submit ARM64 installer signing request
+        uses: signpath/github-action-submit-signing-request@v1.2
+        with:
+          api-token: ${{ secrets.CI_TOKEN }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: Openterface_QT
+          signing-policy-slug: release-signing
+          artifact-configuration-slug: Openterface_Connect_win_arm64_installer
+          github-artifact-id: ${{ steps.upload-arm64-installer.outputs.artifact-id }}
+          wait-for-completion: true
+          output-artifact-directory: artifacts/windows/arm64/signed
+
+      - name: Upload signed ARM64 installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: openterfaceQT_windows_arm64_installer_signed
+          path: artifacts/windows/arm64/signed/openterfaceQT.windows.arm64.installer.exe
+          retention-days: 7
+
+  sign-arm64-portable:
+    needs: wait-for-builds
+    runs-on: windows-latest
+    if: ${{ !inputs.skip_windows_signing && inputs.sign_arm64_portable }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      - name: Download Windows ARM64 portable artifact
+        uses: dawidd6/action-download-artifact@v2
+        with:
+          workflow: windows-arm64-build.yaml
+          workflow_conclusion: success
+          name: openterfaceQT_windows_arm64_portable
+          path: artifacts/windows/arm64/portable
+
+      - name: Upload ARM64 portable artifact for signing
+        id: upload-arm64-portable
+        uses: actions/upload-artifact@v4
+        with:
+          name: openterfaceQT.windows.arm64.portable.unsigned.exe
+          path: artifacts/windows/arm64/portable
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Submit ARM64 portable signing request
+        uses: signpath/github-action-submit-signing-request@v1.2
+        with:
+          api-token: ${{ secrets.CI_TOKEN }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: Openterface_QT
+          signing-policy-slug: release-signing
+          artifact-configuration-slug: Openterface_Connect_win_arm64_portable
+          github-artifact-id: ${{ steps.upload-arm64-portable.outputs.artifact-id }}
+          wait-for-completion: true
+          output-artifact-directory: artifacts/windows/arm64/portable/signed
+
+      - name: Upload signed ARM64 portable
+        uses: actions/upload-artifact@v4
+        with:
+          name: openterfaceQT_windows_arm64_portable_signed
+          path: artifacts/windows/arm64/portable/signed/openterfaceQT.exe
+          retention-days: 7
+  create-release:
+    needs: [wait-for-builds, sign-amd64-installer, sign-amd64-portable, sign-arm64-installer, sign-arm64-portable]
+    if: ${{ always() && (needs.wait-for-builds.result == 'success') && (inputs.skip_windows_signing || (needs.sign-amd64-installer.result == 'success' || needs.sign-amd64-installer.result == 'skipped') && (needs.sign-amd64-portable.result == 'success' || needs.sign-amd64-portable.result == 'skipped') && (needs.sign-arm64-installer.result == 'success' || needs.sign-arm64-installer.result == 'skipped') && (needs.sign-arm64-portable.result == 'success' || needs.sign-arm64-portable.result == 'skipped')) }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+      
+      - name: Extract version from version.h
+        id: extract_version
+        shell: bash
+        run: |
+          FULL_VERSION=$(grep -oP '#define APP_VERSION "\K[^"]+' resources/version.h)
+          # Extract only the first 3 digits (e.g., "0.3.1" from "0.3.1.093")
+          APP_VERSION=$(echo $FULL_VERSION | cut -d. -f1,2,3)
+          echo "APP_VERSION=$APP_VERSION" >> $GITHUB_OUTPUT
+          echo "Using version: $APP_VERSION (from full version: $FULL_VERSION)"
+          
+      - name: Get previous tag
+        id: get_previous_tag
+        shell: bash
+        run: |
+          PREVIOUS_TAG=$(git describe --tags --abbrev=0 || echo "")
+          if [ -z "$PREVIOUS_TAG" ]; then
+            echo "No previous tag found, using first commit"
+            PREVIOUS_TAG=$(git rev-list --max-parents=0 HEAD)
+          fi
+          echo "PREVIOUS_TAG=$PREVIOUS_TAG" >> $GITHUB_OUTPUT
+      
+      - name: Generate changelog
+        id: changelog
+        shell: bash
+        run: |
+          if [ -z "${{ steps.get_previous_tag.outputs.PREVIOUS_TAG }}" ]; then
+            CHANGELOG="Initial release"
+          else
+            CHANGELOG=$(git log ${{ steps.get_previous_tag.outputs.PREVIOUS_TAG }}..HEAD --pretty=format:"- %s")
+            if [ $? -ne 0 ]; then
+              echo "Error generating changelog, defaulting to empty changelog"
+              CHANGELOG="See commit history for changes"
+            fi
+          fi
+          echo "CHANGELOG<<EOF" >> $GITHUB_OUTPUT
+          echo "$CHANGELOG" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+            
+      - name: Download Linux AMD64 DEB artifact
+        uses: dawidd6/action-download-artifact@v2
+        with:
+          workflow: linux-build.yaml
+          workflow_conclusion: success
+          name: openterfaceQT_linux_amd64.deb
+          path: artifacts/linux/amd64/deb
+          
+      - name: Download Linux AMD64 RPM artifact
+        uses: dawidd6/action-download-artifact@v2
+        with:
+          workflow: linux-build.yaml
+          workflow_conclusion: success
+          name: openterfaceQT_linux_amd64.rpm
+          path: artifacts/linux/amd64/rpm
+      
+      - name: Download Linux shared AppImage artifact
+        uses: dawidd6/action-download-artifact@v2
+        with:
+          workflow: linux-build.yaml
+          workflow_conclusion: success
+          name: openterfaceQT_linux_amd64.AppImage
+          path: artifacts/linux/appimage
+
+      - name: Download Arch Linux package artifact
+        uses: dawidd6/action-download-artifact@v2
+        with:
+          workflow: linux-build.yaml
+          workflow_conclusion: success
+          name: openterfaceQT_linux_amd64.pkg.tar.zst
+          path: artifacts/linux/archlinux
+
+      - name: Download signed Windows installer artifact
+        if: ${{ !inputs.skip_windows_signing && inputs.sign_amd64_installer }}
+        uses: actions/download-artifact@v4
+        with:
+          name: openterfaceQT_windows_amd64_installer_signed
+          path: artifacts/windows/signed
+
+      - name: Download signed Windows portable artifact
+        if: ${{ !inputs.skip_windows_signing && inputs.sign_amd64_portable }}
+        uses: actions/download-artifact@v4
+        with:
+          name: openterfaceQT_windows_amd64_portable_signed
+          path: artifacts/windows/signed
+
+      - name: Download signed Windows ARM64 installer artifact
+        if: ${{ !inputs.skip_windows_signing && inputs.sign_arm64_installer }}
+        uses: actions/download-artifact@v4
+        with:
+          name: openterfaceQT_windows_arm64_installer_signed
+          path: artifacts/windows/arm64/signed
+
+      - name: Download signed Windows ARM64 portable artifact
+        if: ${{ !inputs.skip_windows_signing && inputs.sign_arm64_portable }}
+        uses: actions/download-artifact@v4
+        with:
+          name: openterfaceQT_windows_arm64_portable_signed
+          path: artifacts/windows/arm64/portable/signed
+
+      - name: Download unsigned Windows installer artifact
+        if: ${{ inputs.skip_windows_signing || !inputs.sign_amd64_installer }}
+        uses: dawidd6/action-download-artifact@v2
+        with:
+          workflow: windows-build.yaml
+          workflow_conclusion: success
+          name: openterfaceQT_windows_amd64_installer
+          path: artifacts/windows/unsigned
+
+      - name: Download unsigned Windows portable artifact
+        if: ${{ inputs.skip_windows_signing || !inputs.sign_amd64_portable }}
+        uses: dawidd6/action-download-artifact@v2
+        with:
+          workflow: windows-portable-build.yaml
+          workflow_conclusion: success
+          name: openterfaceQT-portable.exe
+          path: artifacts/windows/unsigned
+
+      - name: Download unsigned Windows ARM64 installer artifact
+        if: ${{ inputs.skip_windows_signing || !inputs.sign_arm64_installer }}
+        uses: dawidd6/action-download-artifact@v2
+        with:
+          workflow: windows-arm64-build.yaml
+          workflow_conclusion: success
+          name: openterfaceQT_windows_arm64_installer
+          path: artifacts/windows/unsigned
+
+      - name: Download unsigned Windows ARM64 portable artifact
+        if: ${{ inputs.skip_windows_signing || !inputs.sign_arm64_portable }}
+        uses: dawidd6/action-download-artifact@v2
+        with:
+          workflow: windows-arm64-build.yaml
+          workflow_conclusion: success
+          name: openterfaceQT_windows_arm64_portable
+          path: artifacts/windows/unsigned
+        
+      - name: List all downloaded artifacts
+        run: |
+          echo "Downloaded artifacts:"
+          find artifacts -type f | sort
+
+      - name: Rename Windows artifacts to match upstream format
+        run: |
+          echo "Renaming Windows artifacts..."
+
+          # Rename signed Windows artifacts (if they exist)
+          if [ -f "artifacts/windows/signed/openterfaceQT.windows.amd64.installer.exe" ]; then
+            mv "artifacts/windows/signed/openterfaceQT.windows.amd64.installer.exe" "artifacts/windows/signed/openterfaceQT_windows_amd64_installer.exe"
+            echo "Renamed: openterfaceQT.windows.amd64.installer.exe -> openterfaceQT_windows_amd64_installer.exe"
+          fi
+
+          if [ -f "artifacts/windows/signed/openterfaceQT-portable.exe" ]; then
+            mv "artifacts/windows/signed/openterfaceQT-portable.exe" "artifacts/windows/signed/openterfaceQT_windows_amd64_portable.exe"
+            echo "Renamed: openterfaceQT-portable.exe -> openterfaceQT_windows_amd64_portable.exe"
+          fi
+
+          if [ -f "artifacts/windows/arm64/signed/openterfaceQT.windows.arm64.installer.exe" ]; then
+            mv "artifacts/windows/arm64/signed/openterfaceQT.windows.arm64.installer.exe" "artifacts/windows/arm64/signed/openterfaceQT_windows_arm64_installer.exe"
+            echo "Renamed: openterfaceQT.windows.arm64.installer.exe -> openterfaceQT_windows_arm64_installer.exe"
+          fi
+
+          if [ -f "artifacts/windows/arm64/portable/signed/openterfaceQT.exe" ]; then
+            mv "artifacts/windows/arm64/portable/signed/openterfaceQT.exe" "artifacts/windows/arm64/portable/signed/openterfaceQT_windows_arm64_portable.exe"
+            echo "Renamed: openterfaceQT.exe -> openterfaceQT_windows_arm64_portable.exe"
+          fi
+
+          # Rename unsigned Windows artifacts (if they exist)
+          if [ -f "artifacts/windows/unsigned/openterfaceQT_windows_amd64_installer/openterfaceQT_windows_amd64_installer.exe" ]; then
+            mv "artifacts/windows/unsigned/openterfaceQT_windows_amd64_installer/openterfaceQT_windows_amd64_installer.exe" "artifacts/windows/unsigned/openterfaceQT_windows_amd64_installer.exe"
+            rmdir "artifacts/windows/unsigned/openterfaceQT_windows_amd64_installer" 2>/dev/null || true
+            echo "Renamed unsigned: amd64 installer extracted from subdirectory"
+          elif [ -f "artifacts/windows/unsigned/openterfaceQT.windows.amd64.installer.exe" ]; then
+            mv "artifacts/windows/unsigned/openterfaceQT.windows.amd64.installer.exe" "artifacts/windows/unsigned/openterfaceQT_windows_amd64_installer.exe"
+            echo "Renamed unsigned: openterfaceQT.windows.amd64.installer.exe -> openterfaceQT_windows_amd64_installer.exe"
+          fi
+
+          if [ -f "artifacts/windows/unsigned/openterfaceQT-portable.exe" ]; then
+            mv "artifacts/windows/unsigned/openterfaceQT-portable.exe" "artifacts/windows/unsigned/openterfaceQT_windows_amd64_portable.exe"
+            echo "Renamed unsigned: openterfaceQT-portable.exe -> openterfaceQT_windows_amd64_portable.exe"
+          fi
+
+          if [ -f "artifacts/windows/unsigned/openterfaceQT_windows_arm64_installer/openterfaceQT_windows_arm64_installer.exe" ]; then
+            mv "artifacts/windows/unsigned/openterfaceQT_windows_arm64_installer/openterfaceQT_windows_arm64_installer.exe" "artifacts/windows/unsigned/openterfaceQT_windows_arm64_installer.exe"
+            rmdir "artifacts/windows/unsigned/openterfaceQT_windows_arm64_installer" 2>/dev/null || true
+            echo "Renamed unsigned: arm64 installer extracted from subdirectory"
+          fi
+
+          if [ -f "artifacts/windows/unsigned/openterfaceQT_windows_arm64_portable/openterfaceQT.exe" ]; then
+            mv "artifacts/windows/unsigned/openterfaceQT_windows_arm64_portable/openterfaceQT.exe" "artifacts/windows/unsigned/openterfaceQT_windows_arm64_portable.exe"
+            rmdir "artifacts/windows/unsigned/openterfaceQT_windows_arm64_portable" 2>/dev/null || true
+            echo "Renamed unsigned: arm64 portable extracted from subdirectory"
+          fi
+
+          echo "Final artifacts:"
+          find artifacts -type f | sort
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ steps.extract_version.outputs.APP_VERSION }}
+          name: v${{ steps.extract_version.outputs.APP_VERSION }}
+          body: |
+            ## Change Log
+
+            ${{ steps.changelog.outputs.CHANGELOG }}
+
+          draft: ${{ github.event.inputs.draft }}
+          prerelease: ${{ github.event.inputs.prerelease }}
+          files: |
+            artifacts/linux/**/*
+            artifacts/windows/**/*

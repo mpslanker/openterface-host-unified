@@ -1,0 +1,334 @@
+/*
+* ========================================================================== *
+*                                                                            *
+*    This file is part of the Openterface Mini KVM App QT version            *
+*                                                                            *
+*    Copyright (C) 2024   <info@openterface.com>                             *
+*                                                                            *
+*    This program is free software: you can redistribute it and/or modify    *
+*    it under the terms of the GNU General Public License as published by    *
+*    the Free Software Foundation version 3.                                 *
+*                                                                            *
+*    This program is distributed in the hope that it will be useful, but     *
+*    WITHOUT ANY WARRANTY; without even the implied warranty of              *
+*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU        *
+*    General Public License for more details.                                *
+*                                                                            *
+*    You should have received a copy of the GNU General Public License       *
+*    along with this program. If not, see <http://www.gnu.org/licenses/>.    *
+*                                                                            *
+* ========================================================================== *
+*/
+
+#ifndef GSTREAMERBACKENDHANDLER_H
+#define GSTREAMERBACKENDHANDLER_H
+
+#include "../multimediabackend.h"
+#include <QProcess>
+#include <QWidget>
+#include <QEvent>
+#include <QTimer>
+#include <gst/gst.h>
+#include <gst/app/gstappsink.h>
+#include <atomic>
+
+// Forward declarations for Qt types
+#include "../../ui/videopane.h"
+#include <QGraphicsView>
+#include <QGraphicsVideoItem>
+
+// Forward declarations
+class HotplugMonitor;
+struct DeviceInfo;
+
+// Forward declarations for GStreamer types - now properly defined via includes above
+// typedef struct _GstElement GstElement;
+// typedef struct _GstBus GstBus;
+// typedef struct _GstMessage GstMessage;
+// typedef struct _GstPad GstPad;
+// typedef struct _GstAppSink GstAppSink;
+// typedef enum _GstFlowReturn GstFlowReturn;
+
+/**
+ * @brief GStreamer backend handler implementation with direct pipeline support
+ */
+class GStreamerBackendHandler : public MultimediaBackendHandler
+{
+    Q_OBJECT
+
+public:
+    explicit GStreamerBackendHandler(QObject *parent = nullptr);
+    ~GStreamerBackendHandler();
+
+    MultimediaBackendType getBackendType() const override;
+    QString getBackendName() const override;
+    MultimediaBackendConfig getDefaultConfig() const override;
+
+    void prepareCameraCreation() override;
+    void configureCameraDevice() override;
+    void setupCaptureSession(QMediaCaptureSession* session) override;
+    void prepareVideoOutputConnection(QMediaCaptureSession* session, QObject* videoOutput) override;
+    void finalizeVideoOutputConnection(QMediaCaptureSession* session, QObject* videoOutput) override;
+    void startCamera() override;
+    void stopCamera() override;
+
+    // Hotplug support: track device port chain in private members
+    QList<int> getSupportedFrameRates(const QCameraFormat& format) const override;
+    QCameraFormat selectOptimalFormat(const QList<QCameraFormat>& formats, 
+                                    const QSize& resolution, 
+                                    int desiredFrameRate,
+                                    QVideoFrameFormat::PixelFormat pixelFormat) const override;
+
+    void handleCameraError(int errorCode, const QString& errorString) override;
+
+    // Direct GStreamer pipeline methods (enhanced with working example approach)
+    bool createGStreamerPipeline(const QString& device, const QSize& resolution, int framerate);
+    bool startGStreamerPipeline();
+    void stopGStreamerPipeline();
+    void setVideoOutput(QWidget* widget);
+    void setVideoOutput(QGraphicsVideoItem* videoItem);  // Support for QGraphicsVideoItem
+    void setVideoOutput(VideoPane* videoPane);  // Support for VideoPane overlay
+    
+    // Enhanced methods based on working example
+    bool checkCameraAvailable(const QString& device = "/dev/video0");
+    WId getVideoWidgetWindowId() const;
+    
+    // Resolution and framerate configuration
+    void setResolutionAndFramerate(const QSize& resolution, int framerate);
+    
+    // Video scaling and render rectangle configuration
+    void updateVideoRenderRectangle(const QSize& widgetSize);
+    void updateVideoRenderRectangle(int x, int y, int width, int height);
+
+    // Called by pad probe to increment the internal frame counter (thread-safe)
+    void incrementFrameCount();
+    
+    // Pipeline string generation
+    QString generatePipelineString(const QString& device, const QSize& resolution, int framerate, const QString& videoSink) const;
+
+    // Recording configuration
+    struct RecordingConfig {
+        QString outputPath;
+        QString format = "mp4";          // mp4, avi, mov, mkv
+        QString videoCodec = "x264enc";  // x264enc, x265enc, vp8enc, vp9enc
+        int videoBitrate = 2000000;      // 2 Mbps default
+        int videoQuality = 23;           // Quality setting
+        bool useHardwareAcceleration = false;
+    };
+
+    // Video recording methods
+    bool startRecording(const QString& outputPath, const QString& format = "mp4", int videoBitrate = 2000000) override;
+    bool stopRecording() override;
+    void pauseRecording() override;
+    void resumeRecording() override;
+    bool isRecording() const override;
+    bool isPaused() const;
+    QString getCurrentRecordingPath() const override;
+    qint64 getRecordingDuration() const override;
+    
+    // Image capture methods
+    void takeImage(const QString& filePath);
+    void takeAreaImage(const QString& filePath, const QRect& captureArea);
+    QImage getLatestOriginalFrame();
+    
+    // Advanced recording methods
+    bool isPipelineReady() const;
+    bool supportsAdvancedRecording() const;
+    bool startRecordingAdvanced(const QString& outputPath, const RecordingConfig& config);
+    bool forceStopRecording();
+    QString getLastError() const;
+    
+    // Recording statistics
+    bool supportsRecordingStats() const;
+    qint64 getRecordingFileSize() const;
+    
+    void setRecordingConfig(const RecordingConfig& config);
+    RecordingConfig getRecordingConfig() const;
+
+    // Hotplug support: set current device and port chain for tracking
+    void setCurrentDevicePortChain(const QString& portChain);
+    void setCurrentDevice(const QString& devicePath);
+    
+    // Hotplug monitoring connection
+    void connectToHotplugMonitor();
+
+    // Start a direct GStreamer pipeline using the current device/resolution/framerate
+    // Returns true on successful create + start, false otherwise
+    // NOTE: moved to private section
+
+private slots:
+    void onPipelineMessage();
+    void checkPipelineHealth();
+    // External runner event handlers
+    void onExternalRunnerStarted();
+    void onExternalRunnerFailed(const QString& error);
+    void onExternalRunnerFinished(int exitCode, QProcess::ExitStatus status);
+    // Device hotplug handlers
+    void onDeviceUnplugged(const DeviceInfo& device);
+    void onDevicePluggedIn(const DeviceInfo& device);
+    
+    // Recording lifecycle events are handled by RecordingManager
+
+private:
+    // GStreamer pipeline components
+    GstElement* m_pipeline;
+    GstElement* m_source;
+    GstElement* m_sink;
+    GstBus* m_bus;
+    
+    // Hotplug monitoring
+    HotplugMonitor* m_hotplugMonitor;
+    QString m_currentDevicePortChain;
+    QString m_currentDevicePath;
+    
+    // Recording pipeline components (kept for compatibility during refactor)
+    GstElement* m_recordingPipeline;
+    GstElement* m_recordingTee;
+    GstElement* m_recordingValve;    // Controls recording flow
+    GstElement* m_recordingSink;
+    GstElement* m_recordingQueue;
+    GstElement* m_recordingEncoder;
+    GstElement* m_recordingVideoConvert;
+    GstElement* m_recordingMuxer;
+    GstElement* m_recordingFileSink;
+    GstElement* m_recordingAppSink;  // For frame capture
+    GstPad* m_recordingTeeSrcPad;
+    // Image capture pipeline elements
+    GstElement* m_captureAppSink;    // For image capture from main pipeline
+    GstElement* m_captureQueue;      // Queue for capture branch
+    GstElement* m_captureVideoConvert; // Videoconvert for capture branch (ensures RGB format)
+    GstElement* m_captureCapsFilter; // Capsfilter to force RGB format
+    // Recording manager (encapsulates recording branch logic)
+    class RecordingManager* m_recordingManager;
+    
+    // Qt integration
+    QWidget* m_videoWidget;
+    QGraphicsVideoItem* m_graphicsVideoItem;  // Support for QGraphicsVideoItem
+    VideoPane* m_videoPane;  // Support for VideoPane overlay
+    QTimer* m_healthCheckTimer;
+    QTimer* m_overlayRebuildTimer;
+    QProcess* m_gstProcess;  // Fallback for process-based approach
+
+    // Track all objects with installed event filters for cleanup during destruction
+    QSet<QObject*> m_watchedObjects;
+
+    // Destruction state - signals to event filter to exit early
+    std::atomic<bool> m_isDestructing{false};
+
+    // Capture protection - prevents pipeline rebuilds during screenshot capture
+    std::atomic<bool> m_captureInProgress{false};
+
+    // Pipeline state
+    bool m_pipelineRunning;
+    QString m_selectedSink; // textual name of the selected video sink element
+    QSize m_currentResolution;
+    int m_currentFramerate;
+    
+    // Overlay setup state
+    bool m_overlaySetupPending;
+    // Cached display size used when creating the current pipeline (for resize-triggered rebuilds)
+    QSize m_pipelineDisplaySize;
+    // Flag to prevent multiple post-layout rebuilds
+    bool m_postLayoutRebuildScheduled{false};
+    // Track whether initial pipeline has been created (for deferred startup)
+    bool m_initialPipelineCreated{false};
+    // Cached overlay sink pointer (refcount held while pipeline running)
+#ifdef HAVE_GSTREAMER
+    GstElement* m_currentOverlaySink{nullptr};
+#endif
+    
+    // Recording state (kept for compatibility during refactor)
+    bool m_recordingActive;
+    bool m_recordingPaused;
+    QString m_recordingOutputPath;
+    RecordingConfig m_recordingConfig;
+    qint64 m_recordingStartTime;
+    qint64 m_recordingPausedTime;
+    qint64 m_totalPausedDuration;
+    int m_recordingFrameNumber;
+    
+    // Error tracking
+    QString m_lastError;
+    
+    // Frame-based recording handled by RecordingManager
+
+    // Runner objects (in-process and external)
+    class InProcessGstRunner* m_inProcessRunner;
+    class ExternalGstRunner* m_externalRunner;
+    
+    // Helper methods
+    bool initializeGStreamer();
+    void cleanupGStreamer();
+    bool startDirectPipeline();
+    bool embedVideoInWidget(QWidget* widget);
+    bool embedVideoInGraphicsView(QGraphicsView* view);
+    bool embedVideoInVideoPane(VideoPane* videoPane);
+    void handleGStreamerMessage(GstMessage* message);
+    void completePendingOverlaySetup();
+    
+    // Helper methods for image capture
+    GstSample* getLatestSampleFromPipeline();
+    QImage gstSampleToQImage(GstSample* sample);
+    bool createCaptureAppSink();
+    void destroyCaptureAppSink();
+
+protected:
+    // Override to track video widget/view lifecycle events and respond to winId/show/resize
+    bool eventFilter(QObject *watched, QEvent *event) override;
+
+private slots:
+    void handleOverlayResizeRebuildTimeout();
+
+private:
+    // helper to install/uninstall event filter on widgets
+    void installVideoWidgetEventFilter();
+    void uninstallVideoWidgetEventFilter();
+    void installGraphicsViewEventFilter(QGraphicsView* view);
+    void uninstallGraphicsViewEventFilter(QGraphicsView* view);
+
+    // Get the current display size for pipeline videoscale constraining.
+    // Queries the X screen dimensions first (for X11/XWayland), then falls back
+    // to the widget size. This ensures video fits the actual screen on small
+    // displays like 640x480 Pi touchscreens.
+    QSize getDisplaySizeForPipeline() const;
+
+    // Schedule a deferred rebuild of the running pipeline when the overlay size
+    // changes significantly during resize or layout transitions.
+    void scheduleOverlayPipelineRebuild(int delayMs);
+    bool overlayPipelineSizeChangeRequiresRebuild(const QSize& newSize) const;
+
+    // Ensure a QWidget has a native window (winId()) by creating the window and waiting up to timeoutMs.
+    // Returns true if a native window is available.
+    bool ensureNativeWindowForWidget(QWidget* widget, int timeoutMs = 200) const;
+    
+    // Enhanced overlay methods
+    bool setupVideoOverlay(GstElement* videoSink, WId windowId);
+    void setupVideoOverlayForCurrentPipeline();
+    void refreshVideoOverlay();
+    GstElement* findOverlaySinkInPipeline() const;
+    
+    // Window validation for overlay setup
+    bool isValidWindowId(WId windowId) const;
+    
+    // Recording helper moved to RecordingManager
+    // Delegating recording helper methods (thin wrappers -> RecordingManager)
+    void removeRecordingBranch();
+    QString generateRecordingElements(const QString& outputPath, const QString& format, int videoBitrate) const;
+    bool createSeparateRecordingPipeline(const QString& outputPath, const QString& format, int videoBitrate);
+    bool initializeDirectFilesinkRecording();
+    // Recording samples are handled by RecordingManager when GStreamer is available
+    // FPS probe members
+    std::atomic<quint64> m_frameCount{0};
+#ifdef HAVE_GSTREAMER
+    GstPad* m_frameProbePad{nullptr};
+    guint m_frameProbeId{0};
+    // GstPad probe callback (static so it can be passed to C API without instance)
+    static GstPadProbeReturn gstreamer_frame_probe_cb(GstPad* pad, GstPadProbeInfo* info, gpointer user_data);
+#endif
+
+    // Add helpers to manage frame probe
+    void attachFrameProbe();
+    void detachFrameProbe();
+};
+
+#endif // GSTREAMERBACKENDHANDLER_H

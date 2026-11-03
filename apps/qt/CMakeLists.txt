@@ -1,0 +1,513 @@
+cmake_minimum_required(VERSION 3.16)
+project(openterfaceQT VERSION 1.0 LANGUAGES C CXX)
+
+# Option to control static vs dynamic linking
+option(OPENTERFACE_BUILD_STATIC "Link libraries statically where possible" ON)
+option(OPENTERFACE_BUILD_UNIT_TESTS "Build the unit tests in tests/unit (needs Qt6::Test)" OFF)
+message(STATUS "OPENTERFACE_BUILD_STATIC: ${OPENTERFACE_BUILD_STATIC}")
+
+# If we want a static build on Windows prefer .a libraries when CMake searches (set early so find_package uses it)
+if(OPENTERFACE_BUILD_STATIC AND WIN32)
+    set(CMAKE_FIND_LIBRARY_SUFFIXES ".a")
+    message(STATUS "Early CMAKE_FIND_LIBRARY_SUFFIXES set to: ${CMAKE_FIND_LIBRARY_SUFFIXES}")
+endif()
+
+# Detect architecture at top-level so users can override via -DOPENTERFACE_ARCH if desired
+if(NOT DEFINED OPENTERFACE_ARCH)
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
+    set(OPENTERFACE_ARCH "arm64" CACHE STRING "Openterface target architecture (arm64/amd64/other)")
+    elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64)$")
+        set(OPENTERFACE_ARCH "amd64" CACHE STRING "Openterface target architecture (arm64/amd64/other)")
+    else()
+        set(OPENTERFACE_ARCH "${CMAKE_SYSTEM_PROCESSOR}" CACHE STRING "Openterface target architecture (arm64/amd64/other)")
+    endif()
+endif()
+
+message(STATUS "OPENTERFACE_ARCH: ${OPENTERFACE_ARCH}")
+
+# Convenience booleans derived from OPENTERFACE_ARCH for top-level logic and targets
+if(NOT DEFINED OPENTERFACE_IS_ARM64)
+    if(OPENTERFACE_ARCH STREQUAL "arm64")
+        set(OPENTERFACE_IS_ARM64 TRUE CACHE BOOL "TRUE if target architecture is arm64")
+    else()
+        set(OPENTERFACE_IS_ARM64 FALSE CACHE BOOL "TRUE if target architecture is arm64")
+    endif()
+endif()
+
+if(NOT DEFINED OPENTERFACE_IS_AMD64)
+    if(OPENTERFACE_ARCH STREQUAL "amd64")
+        set(OPENTERFACE_IS_AMD64 TRUE CACHE BOOL "TRUE if target architecture is amd64")
+    else()
+        set(OPENTERFACE_IS_AMD64 FALSE CACHE BOOL "TRUE if target architecture is amd64")
+    endif()
+endif()
+
+message(STATUS "OPENTERFACE_IS_ARM64: ${OPENTERFACE_IS_ARM64}")
+message(STATUS "OPENTERFACE_IS_AMD64: ${OPENTERFACE_IS_AMD64}")
+
+include(cmake/Configuration.cmake)
+
+# Include static linking configuration for compression libraries
+include(cmake/StaticLinking.cmake)
+
+# Provide FFmpeg helper functions (defines add_ffmpeg_static_libraries)
+include(cmake/FFmpeg.cmake OPTIONAL)
+
+# Include internationalization support (defines setup_translations function)
+include(cmake/Internationalization.cmake)
+
+# Add cmake module path for our custom Qt6 finder
+list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
+
+# Use our custom Qt6 finder to ensure version 6.6.3+
+find_package(Qt6Required REQUIRED)
+
+# Find additional Qt components (Qt6Required already found Core, Widgets, Gui, Multimedia, SerialPort, Svg)
+# Note: HttpServer is NOT required — the SSE transport uses raw QTcpServer (Qt6::Network)
+# for Qt 6.5+ compatibility. See server/mcp/mcpSseTransport.h.
+find_package(Qt6 REQUIRED COMPONENTS Network OpenGL OpenGLWidgets Xml Concurrent DBus)
+
+# Find Tesseract OCR (optional - for screen_to_markdown feature)
+find_package(PkgConfig QUIET)
+if(PKG_CONFIG_FOUND)
+    pkg_check_modules(TESSERACT tesseract)
+    pkg_check_modules(LEPTONICA lept)
+endif()
+
+if(TESSERACT_FOUND AND LEPTONICA_FOUND)
+    message(STATUS "Tesseract OCR found - enabling screen_to_markdown feature")
+    add_compile_definitions(HAVE_TESSERACT)
+else()
+    message(WARNING "Tesseract OCR not found - screen_to_markdown feature will be disabled. Install with: sudo dnf install tesseract-devel leptonica-devel")
+endif()
+
+# Find OpenCV (optional - for visual button detection in screen_to_markdown)
+find_package(OpenCV QUIET COMPONENTS core imgproc)
+if(OpenCV_FOUND)
+    message(STATUS "OpenCV found (${OpenCV_VERSION}) - enabling visual button detection")
+    add_compile_definitions(HAVE_OPENCV)
+else()
+    message(STATUS "OpenCV not found - visual button detection disabled. Install with: sudo dnf install opencv-devel")
+endif()
+
+find_package(Threads REQUIRED)
+
+# Use standardized Qt setup if available (Qt >= 6.3); otherwise emulate basics for Qt 6.2
+if(COMMAND qt_standard_project_setup)
+    qt_standard_project_setup()
+else()
+    message(STATUS "qt_standard_project_setup() not available; enabling Qt AUTOMOC/AUTOUIC/AUTORCC and C++17 manually")
+    set(CMAKE_CXX_STANDARD 17)
+    set(CMAKE_CXX_STANDARD_REQUIRED ON)
+    set(CMAKE_AUTOMOC ON)
+    set(CMAKE_AUTOUIC ON)
+    set(CMAKE_AUTORCC ON)
+endif()
+
+# Include source files from modular file
+include(cmake/SourceFiles.cmake)
+
+if(OPENTERFACE_BUILD_UNIT_TESTS)
+    enable_testing()
+    add_subdirectory(tests/unit)
+endif()
+qt_add_executable(openterfaceQT WIN32 ${SOURCE_FILES})
+
+# Explicitly add Windows resource file with forward slash path
+if(WIN32)
+    target_sources(openterfaceQT PRIVATE "${CMAKE_SOURCE_DIR}/openterfaceQT.rc")
+endif()
+
+# Force static linking of compression libraries (must be done early)
+force_static_compression_libraries(openterfaceQT)
+
+# Setup translations after target creation
+setup_translations(openterfaceQT)
+
+# Ensure target can find project headers (needed for includes like "serial/SerialPortManager.h" and "ui/statusevents.h")
+target_include_directories(openterfaceQT PRIVATE
+    ${PROJECT_SOURCE_DIR}
+)
+
+# Ensure Linux time feature macros are set per-target to avoid <ctime> visibility issues
+if(UNIX AND NOT APPLE)
+    # Define feature-test macros for the openterfaceQT target specifically
+    target_compile_definitions(openterfaceQT PRIVATE
+        _DEFAULT_SOURCE=1
+        _GNU_SOURCE=1
+        _XOPEN_SOURCE=700
+    )
+    # Also ensure POSIX source is not enforced
+    target_compile_options(openterfaceQT PRIVATE -U_POSIX_C_SOURCE)
+    
+    # Force system time.h to be included before FFmpeg's time.h
+    # FFmpeg libavutil/time.h conflicts with system time.h and breaks <ctime>
+    # Use -include to force early inclusion of system time.h
+    target_compile_options(openterfaceQT PRIVATE 
+        -include /usr/include/time.h
+    )
+endif()
+
+
+# Debug output for linking
+message(STATUS "Hardware acceleration libraries to link: ${HWACCEL_LIBRARIES}")
+
+# Add FFmpeg compatibility shim for static libs built with newer MinGW-w64
+if(WIN32)
+    target_sources(${PROJECT_NAME} PRIVATE host/backend/ffmpeg_compat_shim.c)
+    message(STATUS "Adding FFmpeg compatibility shim for 64-bit time functions")
+endif()
+
+# Link Qt6 image format plugins statically for static builds (only if targets exist)
+if(OPENTERFACE_BUILD_STATIC)
+    set(_qt_image_plugins Qt6::QJpegPlugin Qt6::QGifPlugin Qt6::QICOPlugin Qt6::QSvgPlugin)
+    foreach(_plug IN LISTS _qt_image_plugins)
+        if(TARGET ${_plug})
+            target_link_libraries(${PROJECT_NAME} PRIVATE ${_plug})
+            if(_plug STREQUAL "Qt6::QJpegPlugin" AND STATIC_JPEG_LIBRARIES)
+                set_target_properties(Qt6::QJpegPlugin PROPERTIES
+                    INTERFACE_LINK_LIBRARIES "${STATIC_JPEG_LIBRARIES}"
+                )
+            endif()
+        else()
+            message(STATUS "Qt plugin target not available: ${_plug} (likely shared Qt or plugin not built) - skipping")
+        endif()
+    endforeach()
+endif()
+
+# Qt6::HttpServer is optional (requires Qt 6.6.3+)
+set(QT_HTTPSERVER_LIB)
+if(TARGET Qt6::HttpServer)
+    set(QT_HTTPSERVER_LIB Qt6::HttpServer)
+    message(STATUS "Qt6::HttpServer found - enabling QHttpServer support")
+else()
+    message(STATUS "Qt6::HttpServer not found - using raw QTcpServer for Qt 6.5 compatibility")
+endif()
+
+target_link_libraries(${PROJECT_NAME} PRIVATE Qt6::Core Qt6::Widgets Qt6::Gui Qt6::Network Qt6::Multimedia Qt6::MultimediaWidgets Qt6::SerialPort Qt6::OpenGL Qt6::OpenGLWidgets Qt6::Xml Qt6::Svg Qt6::SvgWidgets Qt6::Concurrent Qt6::DBus ${QT_HTTPSERVER_LIB} Threads::Threads)
+
+# Link Tesseract OCR libraries if found
+if(TESSERACT_FOUND AND LEPTONICA_FOUND)
+    target_include_directories(${PROJECT_NAME} PRIVATE ${TESSERACT_INCLUDE_DIRS} ${LEPTONICA_INCLUDE_DIRS})
+    target_link_libraries(${PROJECT_NAME} PRIVATE ${TESSERACT_LIBRARIES} ${LEPTONICA_LIBRARIES})
+    message(STATUS "Linking Tesseract OCR libraries")
+endif()
+
+# Link OpenCV libraries if found
+if(OpenCV_FOUND)
+    target_include_directories(${PROJECT_NAME} PRIVATE ${OpenCV_INCLUDE_DIRS})
+    target_link_libraries(${PROJECT_NAME} PRIVATE ${OpenCV_LIBRARIES})
+    message(STATUS "Linking OpenCV libraries (${OpenCV_LIBRARIES})")
+endif()
+
+# Link Windows HID and SetupAPI libraries
+if(WIN32)
+    target_link_libraries(${PROJECT_NAME} PRIVATE hid setupapi cfgmgr32 ole32)
+
+    # Note: libssp is linked via FFmpeg.cmake's _FFMPEG_STATIC_DEPS
+    # Do NOT add -lssp here to avoid multiple definition conflicts
+    target_link_options(${PROJECT_NAME} PRIVATE -fstack-protector-strong)
+    target_compile_options(${PROJECT_NAME} PRIVATE -fstack-protector-strong)
+endif()
+
+# Link Windows HID and SetupAPI libraries
+if(WIN32)
+    target_link_libraries(${PROJECT_NAME} PRIVATE hid setupapi cfgmgr32 ole32)
+endif()
+
+# Link X11 libraries for Linux builds to resolve X11 symbols used in overlay code
+if(UNIX AND NOT APPLE)
+    target_link_libraries(${PROJECT_NAME} PRIVATE ${X11_LIBRARIES})
+endif()
+
+# For static Qt builds on Windows with MinGW, link MinGW runtime libraries
+# When building static on Windows, prefer real static libraries (.a) over import libs (.dll.a)
+if(OPENTERFACE_BUILD_STATIC AND WIN32)
+    if(OPENTERFACE_IS_ARM64)
+        # MSYS2 CLANGARM64 environment
+        set(MSYS_MINGW_PATH "/c/msys64/clangarm64")
+    else()
+        set(MSYS_MINGW_PATH "/c/msys64/mingw64")
+    endif()
+    list(INSERT CMAKE_LIBRARY_PATH 0 "${MSYS_MINGW_PATH}/lib")
+    list(INSERT CMAKE_INCLUDE_PATH 0 "${MSYS_MINGW_PATH}/include")
+    message(STATUS "Using MSYS2 MinGW path: ${MSYS_MINGW_PATH}")
+endif()
+
+# For static Qt builds, we need to link platform plugins and their dependencies (Linux only)
+if(OPENTERFACE_BUILD_STATIC AND NOT WIN32)
+    # Link XCB platform plugin directly using file path
+    set(QT_XCB_PLUGIN_PATH "/opt/Qt6/plugins/platforms/libqxcb.a")
+    if(EXISTS ${QT_XCB_PLUGIN_PATH})
+        target_link_libraries(${PROJECT_NAME} PRIVATE ${QT_XCB_PLUGIN_PATH})
+        message(STATUS "Linking XCB platform plugin: ${QT_XCB_PLUGIN_PATH}")
+    else()
+        message(WARNING "XCB platform plugin not found at: ${QT_XCB_PLUGIN_PATH}")
+    endif()
+
+    # Link Offscreen platform plugin for headless environments
+    set(QT_OFFSCREEN_PLUGIN_PATH "/opt/Qt6/plugins/platforms/libqoffscreen.a")
+    if(EXISTS ${QT_OFFSCREEN_PLUGIN_PATH})
+        target_link_libraries(${PROJECT_NAME} PRIVATE ${QT_OFFSCREEN_PLUGIN_PATH})
+        message(STATUS "Linking Offscreen platform plugin: ${QT_OFFSCREEN_PLUGIN_PATH}")
+    else()
+        message(WARNING "Offscreen platform plugin not found at: ${QT_OFFSCREEN_PLUGIN_PATH}")
+    endif()
+
+    # Link Wayland platform plugin for Wayland sessions
+    set(QT_WAYLAND_PLUGIN_EGL "/opt/Qt6/plugins/platforms/libqwayland-egl.a")
+    set(QT_WAYLAND_PLUGIN "/opt/Qt6/plugins/platforms/libqwayland.a")
+    if(EXISTS ${QT_WAYLAND_PLUGIN_EGL})
+        target_link_libraries(${PROJECT_NAME} PRIVATE ${QT_WAYLAND_PLUGIN_EGL})
+        message(STATUS "Linking Wayland platform plugin: ${QT_WAYLAND_PLUGIN_EGL}")
+    elseif(EXISTS ${QT_WAYLAND_PLUGIN})
+        target_link_libraries(${PROJECT_NAME} PRIVATE ${QT_WAYLAND_PLUGIN})
+        message(STATUS "Linking Wayland platform plugin: ${QT_WAYLAND_PLUGIN}")
+    else()
+        message(WARNING "Wayland platform plugin not found under /opt/Qt6/plugins/platforms")
+    endif()
+
+    # Link Wayland client support libraries if available
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(WAYLAND_CLIENT wayland-client)
+    if(WAYLAND_CLIENT_FOUND)
+        target_link_libraries(${PROJECT_NAME} PRIVATE ${WAYLAND_CLIENT_LIBRARIES})
+        target_include_directories(${PROJECT_NAME} PRIVATE ${WAYLAND_CLIENT_INCLUDE_DIRS})
+        message(STATUS "Wayland client libs: ${WAYLAND_CLIENT_LIBRARIES}")
+    endif()
+    pkg_check_modules(WAYLAND_EGL wayland-egl)
+    if(WAYLAND_EGL_FOUND)
+        target_link_libraries(${PROJECT_NAME} PRIVATE ${WAYLAND_EGL_LIBRARIES})
+        target_include_directories(${PROJECT_NAME} PRIVATE ${WAYLAND_EGL_INCLUDE_DIRS})
+        message(STATUS "Wayland EGL libs: ${WAYLAND_EGL_LIBRARIES}")
+    endif()
+    pkg_check_modules(XKBCOMMON xkbcommon)
+    if(XKBCOMMON_FOUND)
+        target_link_libraries(${PROJECT_NAME} PRIVATE ${XKBCOMMON_LIBRARIES})
+        target_include_directories(${PROJECT_NAME} PRIVATE ${XKBCOMMON_INCLUDE_DIRS})
+    endif()
+
+    # If Qt WaylandClient module exists in the static toolchain, link it
+    find_package(Qt6 QUIET COMPONENTS WaylandClient)
+    if(TARGET Qt6::WaylandClient)
+        target_link_libraries(${PROJECT_NAME} PRIVATE Qt6::WaylandClient)
+        message(STATUS "Linking Qt6::WaylandClient module")
+    endif()
+
+    # Link Qt XCB QPA library (required by XCB plugin)
+    set(QT_XCB_QPA_PATH "/opt/Qt6/lib/libQt6XcbQpa.a")
+    if(EXISTS ${QT_XCB_QPA_PATH})
+        target_link_libraries(${PROJECT_NAME} PRIVATE ${QT_XCB_QPA_PATH})
+        message(STATUS "Linking Qt6 XCB QPA library: ${QT_XCB_QPA_PATH}")
+    endif()
+    
+    # Force static linking of xcb-cursor with whole-archive to avoid dynamic dependency at runtime
+    if(DEFINED XCB_CURSOR_LIBRARIES AND XCB_CURSOR_LIBRARIES)
+        message(STATUS "Linking xcb-cursor statically: ${XCB_CURSOR_LIBRARIES}")
+        target_link_libraries(${PROJECT_NAME} PRIVATE 
+            -Wl,--whole-archive
+            ${XCB_CURSOR_LIBRARIES}
+            -Wl,--no-whole-archive
+        )
+    else()
+        message(WARNING "Static xcb-cursor library not detected by Configuration.cmake; falling back may cause runtime dependency on libxcb-cursor.so.0")
+        # Optionally enforce static-only:
+        # message(FATAL_ERROR "Static build requested but libxcb-cursor.a not found. Ensure static libxcb-cursor is installed and detected.")
+    endif()
+    
+    # Link other XCB static libraries normally
+    set(XCB_STATIC_LIBS
+        /usr/lib/aarch64-linux-gnu/libxcb-icccm.a
+        /usr/lib/aarch64-linux-gnu/libxcb-image.a
+        /usr/lib/aarch64-linux-gnu/libxcb-keysyms.a
+        /usr/lib/aarch64-linux-gnu/libxcb-randr.a
+        /usr/lib/aarch64-linux-gnu/libxcb-render-util.a
+        /usr/lib/aarch64-linux-gnu/libxcb-shm.a
+        /usr/lib/aarch64-linux-gnu/libxcb-sync.a
+        /usr/lib/aarch64-linux-gnu/libxcb-xfixes.a
+        /usr/lib/aarch64-linux-gnu/libxcb-render.a
+        /usr/lib/aarch64-linux-gnu/libxcb-shape.a
+        /usr/lib/aarch64-linux-gnu/libxcb-xkb.a
+        /usr/lib/aarch64-linux-gnu/libxcb.a
+        /usr/lib/aarch64-linux-gnu/libxcb-util.a
+    )
+    
+    # Check if static libraries exist and link them
+    foreach(XCB_LIB ${XCB_STATIC_LIBS})
+        if(EXISTS ${XCB_LIB})
+            target_link_libraries(${PROJECT_NAME} PRIVATE ${XCB_LIB})
+            message(STATUS "Linking static XCB library: ${XCB_LIB}")
+        else()
+            message(WARNING "Static XCB library not found: ${XCB_LIB}")
+        endif()
+    endforeach()
+    
+    # Link additional dependencies needed by XCB plugins
+    target_link_libraries(${PROJECT_NAME} PRIVATE xkbcommon xkbcommon-x11 Xau Xdmcp)
+endif()
+
+# Add XCB cursor library for static linking (Linux only) - Legacy support
+if(UNIX AND NOT APPLE AND XCB_CURSOR_FOUND)
+    # This is redundant now but keeping for compatibility
+    message(STATUS "XCB cursor already linked via static approach above")
+endif()
+
+# Add TurboJPEG if available
+if(TURBOJPEG_LIBRARY)
+    target_link_libraries(openterfaceQT PRIVATE ${TURBOJPEG_LIBRARIES})
+endif()
+
+# Add FFmpeg libraries if available
+link_ffmpeg_libraries()
+
+# Diagnostic: detect if generated link response files contain references to .dll or import libs
+# (helps detect cases where import libs / shared libs are still used instead of static .a)
+file(GLOB LINK_RSP_FILES "${CMAKE_BINARY_DIR}/CMakeFiles/*/linkLibs.rsp")
+foreach(_f IN LISTS LINK_RSP_FILES)
+    file(READ "${_f}" _content)
+    if(_content MATCHES "\\.dll" OR _content MATCHES "dll\.a")
+        message(WARNING "Link response file ${_f} contains .dll references; build may still depend on DLLs. Inspect the file to find which libraries are used.")
+    endif()
+endforeach()
+
+# Add libjpeg libraries if available
+if(LIBJPEG_FOUND)
+    target_link_libraries(openterfaceQT PRIVATE ${LIBJPEG_LIBRARIES})
+    target_include_directories(openterfaceQT PRIVATE ${LIBJPEG_INCLUDE_DIRS})
+endif()
+
+# Add GStreamer libraries if available (Linux only)
+if(NOT WIN32)
+    link_gstreamer_libraries()
+
+    # dlopen wrapper for static builds - requires --wrap=dlopen on the linker
+    if(OPENTERFACE_BUILD_STATIC)
+        target_link_options(openterfaceQT PRIVATE -Wl,--wrap=dlopen)
+    endif()
+endif()
+
+# Link Media Foundation libraries on Windows
+if(WIN32)
+    target_link_libraries(openterfaceQT PRIVATE
+        mf
+        mfplat
+        mfreadwrite
+        mfuuid
+        wmcodecdspuuid
+    )
+    message(STATUS "Linked Media Foundation libraries for Windows video capture")
+endif()
+
+# Add DBus on Unix systems (excluding macOS)
+if(UNIX AND NOT APPLE)
+    target_link_libraries(openterfaceQT PRIVATE Qt6::DBus)
+    
+    # Link hardware acceleration libraries if enabled
+    if(USE_HWACCEL AND HWACCEL_LIBRARIES)
+        target_link_libraries(openterfaceQT PRIVATE ${HWACCEL_LIBRARIES})
+        message(STATUS "Linked HWACCEL libraries: ${HWACCEL_LIBRARIES}")
+    endif()
+endif()
+
+# Resources:
+include(cmake/Resources.cmake)
+
+# Add these lines to enable size optimization
+if(CMAKE_BUILD_TYPE STREQUAL "Release")
+    # Enable Link Time Optimization (but not for ARM64 to avoid segfaults)
+    if(OPENTERFACE_IS_AMD64)
+        include(CheckIPOSupported)
+        check_ipo_supported(RESULT LTO_SUPPORTED OUTPUT LTO_ERROR)
+        if(LTO_SUPPORTED)
+            message(STATUS "IPO / LTO enabled")
+            set(CMAKE_INTERPROCEDURAL_OPTIMIZATION TRUE)
+        else()
+            message(STATUS "IPO / LTO not supported: ${LTO_ERROR}")
+        endif()
+        
+        # Optimize for size (only for non-ARM64 builds)
+        add_compile_options(-Os)
+        message(STATUS "Using -Os optimization for non-ARM64 build")
+
+        add_compile_options(-ffunction-sections -fdata-sections)
+        message(STATUS "Using function/data sections for non-ARM64 build")
+    else()
+        message(STATUS "Skipping LTO and -Os optimization for ARM64 to prevent segfaults")
+    endif()
+    
+    # Strip unused symbols
+    if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        if(OPENTERFACE_IS_AMD64)
+            add_link_options(-Wl,--gc-sections)
+        else()
+            message(STATUS "Skipping --gc-sections for ARM64 to prevent linker issues")
+        endif()
+    endif()
+endif()
+
+# Copy local-build launcher to output directory
+add_custom_command(TARGET openterfaceQT POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_SOURCE_DIR}/build-script/openterfaceQT-local-launcher.sh"
+        "$<TARGET_FILE_DIR:openterfaceQT>/openterfaceQT-launcher.sh"
+    COMMENT "Copying local launcher to build directory"
+)
+
+# =============================================================================
+# Testing (opt-in via -DBUILD_TESTING=ON)
+# =============================================================================
+option(BUILD_TESTING "Build the QtTest test suite" OFF)
+if(BUILD_TESTING)
+    message(STATUS "Testing enabled — building MCP test suite")
+    add_subdirectory(tests/mcp)
+endif()
+
+# Qt components already found above
+# =============================================================================
+# Installation Targets (Linux only)
+# =============================================================================
+if(UNIX AND NOT APPLE)
+    # Install the main binary
+    install(TARGETS openterfaceQT
+        BUNDLE DESTINATION .
+        RUNTIME DESTINATION bin
+    )
+    
+    # Install desktop entry file for system menu integration
+    if(EXISTS "${CMAKE_SOURCE_DIR}/packaging/com.openterface.openterfaceQT.desktop")
+        install(FILES "${CMAKE_SOURCE_DIR}/packaging/com.openterface.openterfaceQT.desktop"
+            DESTINATION share/applications
+        )
+        message(STATUS "Desktop entry will be installed to: share/applications/com.openterface.openterfaceQT.desktop")
+    endif()
+    
+    # Install application icon if it exists
+    if(EXISTS "${CMAKE_SOURCE_DIR}/packaging/com.openterface.openterfaceQT.png")
+        install(FILES "${CMAKE_SOURCE_DIR}/packaging/com.openterface.openterfaceQT.png"
+            DESTINATION share/icons/hicolor/256x256/apps
+            RENAME com.openterface.openterfaceQT.png
+        )
+        message(STATUS "Application icon will be installed to: share/icons/hicolor/256x256/apps/")
+    elseif(EXISTS "${CMAKE_SOURCE_DIR}/resources/app_icon.png")
+        install(FILES "${CMAKE_SOURCE_DIR}/resources/app_icon.png"
+            DESTINATION share/icons/hicolor/256x256/apps
+            RENAME com.openterface.openterfaceQT.png
+        )
+        message(STATUS "Application icon will be installed from resources/")
+    else()
+        message(WARNING "Application icon not found - desktop entry will use default icon")
+    endif()
+    
+    # Print installation summary
+    message(STATUS "")
+    message(STATUS "=== Installation Summary ===")
+    message(STATUS "After running 'sudo make install':")
+    message(STATUS "  Binary:      /usr/local/bin/openterfaceQT")
+    message(STATUS "  Desktop:     /usr/share/applications/com.openterface.openterfaceQT.desktop")
+    message(STATUS "  Icon:        /usr/share/icons/hicolor/256x256/apps/com.openterface.openterfaceQT.png")
+    message(STATUS "")
+    message(STATUS "To update desktop database (optional):")
+    message(STATUS "  sudo update-desktop-database")
+    message(STATUS "============================")
+    message(STATUS "")
+endif()

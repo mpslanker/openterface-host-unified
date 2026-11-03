@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=OpenterfaceQT
+Comment=KVM over USB for seamless computer control
+Exec=openterfaceQT
+Icon=com.openterface.openterfaceQT
+Terminal=false
+Categories=Utility;
+Keywords=openterface;open-source;kvm;mini-kvm;remote-control;server;management;hardware;accessory;
+StartupNotify=true
+StartupWMClass=openterfaceQT
