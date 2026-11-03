@@ -1,0 +1,21 @@
+name: Check upstream drift
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 13 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out integration history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check official upstream branches
+        run: ./scripts/check-upstreams.sh
